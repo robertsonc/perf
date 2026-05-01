@@ -10,11 +10,19 @@ dashboard:
 
 iperf3:
   port: 5201
-  duration_s: 10
-  parallel_streams: 4
   protocol: tcp                 # tcp | udp
+  parallel_streams: 4
   reverse: false                # iperf3 -R (server → client)
+
+  # Continuous mode: iperf3 runs uninterrupted, dashboard updates every
+  # interval_s seconds. Recommended for live monitoring.
+  continuous: true
+  interval_s: 1
+
+  # Burst mode (continuous: false): one iperf3 invocation per cycle.
+  duration_s: 10
   cooldown_s: 1
+
   # window_kib: 4096            # iperf3 -w (TCP only)
   # mss_bytes: 1400             # iperf3 -M (TCP only)
   # udp_bandwidth: "950M"       # iperf3 -b (UDP only, 0 = unlimited)

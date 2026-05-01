@@ -1,23 +1,45 @@
 """iperf3 client wrapper with structured result parsing.
 
-Runs the local iperf3 binary against the remote daemon. Captures full JSON
-output and synthesises a typed result dataclass with goodput, retransmits,
-jitter, packet loss, and the wallclock window the run actually occupied.
+Two modes:
+  * Burst: per-run JSON output, one Iperf3Result per cycle.
+  * Continuous: iperf3 -t 0 -i 1, streaming text output parsed line-by-line.
+    Yields one Iperf3Interval per second.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 import shutil
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 from config import Config
 from poller import WireDelta
 
 log = logging.getLogger(__name__)
+
+
+# Matches the [SUM] interval lines emitted by iperf3 with -i N.
+# TCP example:  [SUM]   1.00-2.00   sec   180 MBytes  1.51 Gbits/sec    0
+# UDP example:  [SUM]   1.00-2.00   sec   180 MBytes  1.51 Gbits/sec
+# Final summary lines have a trailing "sender" or "receiver" — we skip those
+# by checking the role group.
+_SUM_INTERVAL_RE = re.compile(
+    r"^\[SUM\]\s+"
+    r"(?P<t0>\d+(?:\.\d+)?)-(?P<t1>\d+(?:\.\d+)?)\s+sec\s+"
+    r"(?P<bytes>\d+(?:\.\d+)?)\s+(?P<bytes_unit>[KMGT]?)Bytes\s+"
+    r"(?P<rate>\d+(?:\.\d+)?)\s+(?P<rate_unit>[KMG]?)bits/sec"
+    r"(?:\s+(?P<retx>\d+))?"
+    r"(?:\s+(?P<role>sender|receiver))?"
+    r"\s*$"
+)
+
+_BYTE_UNIT_MULT = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+_BIT_UNIT_MULT_MBPS = {"": 1e-6, "K": 1e-3, "M": 1.0, "G": 1000.0}
 
 
 @dataclass(slots=True)
@@ -47,6 +69,49 @@ class Iperf3Result:
     streams: list[dict[str, Any]] = field(default_factory=list)
 
     raw: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class Iperf3Interval:
+    """One streaming interval (typically 1s) from continuous-mode iperf3."""
+    t_start_mono: float
+    t_end_mono: float
+    interval_s: float
+    bytes: int
+    bitrate_mbps: float
+    retransmits: int = 0
+    cumulative_retransmits: int = 0
+
+
+def _parse_interval_line(
+    line: str, t_offset_mono: float,
+) -> Iperf3Interval | None:
+    """Parse a single [SUM] interval line into an Iperf3Interval, or None."""
+    m = _SUM_INTERVAL_RE.match(line.strip())
+    if not m or m.group("role"):
+        return None
+    try:
+        t0 = float(m.group("t0"))
+        t1 = float(m.group("t1"))
+        bytes_val = float(m.group("bytes"))
+        bytes_unit = (m.group("bytes_unit") or "").upper()
+        rate_val = float(m.group("rate"))
+        rate_unit = (m.group("rate_unit") or "").upper()
+        retx = int(m.group("retx") or 0)
+    except (ValueError, KeyError):
+        return None
+
+    bytes_mult = _BYTE_UNIT_MULT.get(bytes_unit, 1)
+    rate_mult = _BIT_UNIT_MULT_MBPS.get(rate_unit, 1.0)
+
+    return Iperf3Interval(
+        t_start_mono=t_offset_mono + t0,
+        t_end_mono=t_offset_mono + t1,
+        interval_s=max(0.001, t1 - t0),
+        bytes=int(bytes_val * bytes_mult),
+        bitrate_mbps=rate_val * rate_mult,
+        retransmits=retx,
+    )
 
 
 @dataclass(slots=True)
@@ -128,6 +193,118 @@ class Iperf3Runner:
             if ic.mss_bytes:
                 cmd += ["-M", str(ic.mss_bytes)]
         return cmd
+
+    def _build_continuous_cmd(self) -> list[str]:
+        """Build iperf3 args for continuous text-mode streaming."""
+        cfg = self._config
+        ic = cfg.iperf3
+        target = cfg.hosts.server.data_ip
+        if not target:
+            raise RuntimeError("hosts.server.data_ip is required")
+        # -t 0 = run forever (until killed). Older iperf3 versions treat 0 as
+        # "no time limit" which works for TCP. For maximum compatibility we
+        # use a 24h ceiling and just kill the process when stopping.
+        cmd: list[str] = [
+            "iperf3",
+            "-c", target,
+            "-p", str(ic.port),
+            "-t", "86400",
+            "-i", str(ic.interval_s),
+            "-P", str(ic.parallel_streams),
+            "--connect-timeout", "5000",
+        ]
+        if ic.reverse:
+            cmd.append("-R")
+        if ic.protocol == "udp":
+            cmd.append("-u")
+            cmd += ["-b", ic.udp_bandwidth or "0"]
+            if ic.udp_length:
+                cmd += ["-l", str(ic.udp_length)]
+        else:
+            if ic.window_kib:
+                cmd += ["-w", f"{ic.window_kib}K"]
+            if ic.mss_bytes:
+                cmd += ["-M", str(ic.mss_bytes)]
+        # Force line-buffered stdout so per-second [SUM] lines reach us
+        # without a 4KB pipe-buffer delay. stdbuf is from coreutils, always
+        # available on modern Linux. If absent we still work, just laggier.
+        if shutil.which("stdbuf"):
+            cmd = ["stdbuf", "-oL"] + cmd
+        return cmd
+
+    async def run_continuous(
+        self, stop_event: asyncio.Event,
+    ) -> AsyncIterator[Iperf3Interval]:
+        """Run iperf3 continuously, yielding one Iperf3Interval per report.
+
+        The subprocess runs until `stop_event` is set or it dies on its own.
+        Stderr is drained concurrently so it doesn't block on a full pipe.
+        """
+        cmd = self._build_continuous_cmd()
+        log.info("iperf3 continuous: %s", " ".join(cmd))
+        t_offset = time.monotonic()
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr_buf: deque[str] = deque(maxlen=200)
+        cumulative_retx = 0
+
+        async def _drain_stderr() -> None:
+            assert proc.stderr is not None
+            async for line_b in proc.stderr:
+                stderr_buf.append(line_b.decode("utf-8", errors="replace"))
+
+        stderr_task = asyncio.create_task(_drain_stderr())
+
+        try:
+            assert proc.stdout is not None
+            while not stop_event.is_set():
+                try:
+                    line_b = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    if proc.returncode is not None:
+                        break
+                    continue
+                if not line_b:
+                    break  # EOF — process ended
+                line = line_b.decode("utf-8", errors="replace")
+                interval = _parse_interval_line(line, t_offset)
+                if interval is None:
+                    continue
+                # Per-interval retx is cumulative since start in iperf3; the
+                # raw counter already represents the rolling total. Convert
+                # to per-interval delta for display.
+                this_interval_retx = max(
+                    0, interval.retransmits - cumulative_retx
+                )
+                cumulative_retx = interval.retransmits
+                interval.cumulative_retransmits = cumulative_retx
+                interval.retransmits = this_interval_retx
+                yield interval
+        finally:
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            if proc.returncode not in (0, -15, None):  # 0=ok, -15=SIGTERM
+                err = "".join(stderr_buf).strip()
+                log.warning(
+                    "iperf3 exited %d: %s",
+                    proc.returncode, err or "(no stderr)",
+                )
 
     async def run_one(self) -> Iperf3Result:
         cmd = self._build_cmd()

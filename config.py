@@ -21,6 +21,10 @@ class Iperf3Config(BaseModel):
     protocol: Literal["tcp", "udp"] = "tcp"
     reverse: bool = False
     cooldown_s: float = Field(default=1.0, ge=0.0, le=300.0)
+    # Continuous mode: iperf3 runs uninterrupted, dashboard updates every
+    # `interval_s` seconds. duration_s and cooldown_s are ignored.
+    continuous: bool = False
+    interval_s: int = Field(default=1, ge=1, le=60)
     window_kib: int | None = Field(default=None, ge=1)
     mss_bytes: int | None = Field(default=None, ge=88, le=9000)
     udp_bandwidth: str | None = None

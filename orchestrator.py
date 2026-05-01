@@ -22,7 +22,7 @@ from pathlib import Path
 from config import Config, load_config
 from dashboard import Dashboard
 from poller import WirePoller, read_local_proc_net_dev
-from runner import Iperf3Runner, analyze_run
+from runner import Iperf3Result, Iperf3Runner, analyze_run
 from ssh_pool import SshError, SshPool, detect_local_iface_for_ip
 
 log = logging.getLogger("sdwan_perf")
@@ -53,6 +53,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--duration", type=int)
     p.add_argument("--reverse", action=argparse.BooleanOptionalAction)
     p.add_argument("--udp-bandwidth")
+    p.add_argument("--continuous", action=argparse.BooleanOptionalAction,
+                   help="Run iperf3 continuously, update dashboard every interval_s")
+    p.add_argument("--interval", type=int, dest="interval_s",
+                   help="Continuous-mode update interval in seconds (default 1)")
     return p.parse_args()
 
 
@@ -72,6 +76,10 @@ def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
         raw["iperf3"]["reverse"] = args.reverse
     if args.udp_bandwidth is not None:
         raw["iperf3"]["udp_bandwidth"] = args.udp_bandwidth
+    if args.continuous is not None:
+        raw["iperf3"]["continuous"] = args.continuous
+    if args.interval_s is not None:
+        raw["iperf3"]["interval_s"] = args.interval_s
     return Config.model_validate(raw)
 
 
@@ -171,66 +179,20 @@ async def _run(config: Config) -> int:
         runner = Iperf3Runner(config=config)
 
         try:
-            run_n = 0
-            while not stop_event.is_set():
-                run_n += 1
-                log.info(
-                    "Run #%d  [%s %s P=%d t=%ds]",
-                    run_n,
-                    config.iperf3.protocol.upper(),
-                    "↓ download" if config.iperf3.reverse else "↑ upload",
-                    config.iperf3.parallel_streams,
-                    config.iperf3.duration_s,
+            if config.iperf3.continuous:
+                await _run_continuous(
+                    config, runner,
+                    client_poller, frr_poller, server_poller,
+                    client_iface, server_iface,
+                    dashboard, stop_event,
                 )
-
-                t_start = client_poller.now()
-                result = await runner.run_one()
-                t_end = client_poller.now()
-
-                if not result.success:
-                    log.warning("  Run #%d failed: %s", run_n, result.error)
-
-                # Wait one extra poller tick so the post-iperf3 sample lands.
-                await asyncio.sleep(config.poller_interval_s + 0.1)
-
-                client_w = client_poller.window(t_start, t_end)
-                frr_w = frr_poller.window(t_start, t_end)
-                server_w = server_poller.window(t_start, t_end)
-
-                analysis = analyze_run(
-                    run_n=run_n,
-                    iperf_result=result,
-                    client_deltas=client_w,
-                    frr_deltas=frr_w,
-                    server_deltas=server_w,
-                    config=config,
-                    client_iface=client_iface,
-                    server_iface=server_iface,
+            else:
+                await _run_burst(
+                    config, runner,
+                    client_poller, frr_poller, server_poller,
+                    client_iface, server_iface,
+                    dashboard, stop_event,
                 )
-                dashboard.publish(analysis)
-
-                if result.success:
-                    log.info(
-                        "  goodput=%.1f Mbps  client_tx=%.1f  frr=%.1f  server_rx=%.1f  "
-                        "tcp/ip=%.1f%%  tunnel=%.1f%%  e2e_loss=%.2f%%  retx=%d",
-                        result.goodput_mbps,
-                        analysis.client.bulk_mbps if analysis.client else 0,
-                        analysis.frr.bulk_mbps if analysis.frr else 0,
-                        analysis.server.bulk_mbps if analysis.server else 0,
-                        analysis.tcp_ip_overhead_pct,
-                        analysis.tunnel_overhead_pct,
-                        analysis.e2e_loss_pct,
-                        result.retransmits,
-                    )
-
-                if config.iperf3.cooldown_s > 0 and not stop_event.is_set():
-                    try:
-                        await asyncio.wait_for(
-                            stop_event.wait(),
-                            timeout=config.iperf3.cooldown_s,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
         finally:
             log.info("Shutting down…")
             await client_poller.stop()
@@ -239,6 +201,137 @@ async def _run(config: Config) -> int:
             await dashboard.stop()
             await pool.server.stop_iperf3_server()
     return 0
+
+
+async def _run_burst(
+    config: Config,
+    runner: Iperf3Runner,
+    client_poller, frr_poller, server_poller,
+    client_iface: str, server_iface: str,
+    dashboard, stop_event: asyncio.Event,
+) -> None:
+    """Original burst-mode loop: one iperf3 invocation per cycle."""
+    run_n = 0
+    while not stop_event.is_set():
+        run_n += 1
+        log.info(
+            "Run #%d  [%s %s P=%d t=%ds]",
+            run_n,
+            config.iperf3.protocol.upper(),
+            "↓ download" if config.iperf3.reverse else "↑ upload",
+            config.iperf3.parallel_streams,
+            config.iperf3.duration_s,
+        )
+        t_start = client_poller.now()
+        result = await runner.run_one()
+        t_end = client_poller.now()
+
+        if not result.success:
+            log.warning("  Run #%d failed: %s", run_n, result.error)
+
+        await asyncio.sleep(config.poller_interval_s + 0.1)
+
+        client_w = client_poller.window(t_start, t_end)
+        frr_w = frr_poller.window(t_start, t_end)
+        server_w = server_poller.window(t_start, t_end)
+
+        analysis = analyze_run(
+            run_n=run_n,
+            iperf_result=result,
+            client_deltas=client_w,
+            frr_deltas=frr_w,
+            server_deltas=server_w,
+            config=config,
+            client_iface=client_iface,
+            server_iface=server_iface,
+        )
+        dashboard.publish(analysis)
+
+        if result.success:
+            log.info(
+                "  goodput=%.1f Mbps  client_tx=%.1f  frr=%.1f  server_rx=%.1f  "
+                "tcp/ip=%.1f%%  tunnel=%.1f%%  e2e_loss=%.2f%%  retx=%d",
+                result.goodput_mbps,
+                analysis.client.bulk_mbps if analysis.client else 0,
+                analysis.frr.bulk_mbps if analysis.frr else 0,
+                analysis.server.bulk_mbps if analysis.server else 0,
+                analysis.tcp_ip_overhead_pct,
+                analysis.tunnel_overhead_pct,
+                analysis.e2e_loss_pct,
+                result.retransmits,
+            )
+
+        if config.iperf3.cooldown_s > 0 and not stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=config.iperf3.cooldown_s,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+
+async def _run_continuous(
+    config: Config,
+    runner: Iperf3Runner,
+    client_poller, frr_poller, server_poller,
+    client_iface: str, server_iface: str,
+    dashboard, stop_event: asyncio.Event,
+) -> None:
+    """Continuous-mode loop: stream interval reports, publish each one."""
+    log.info(
+        "Continuous mode: iperf3 -i %ds, dashboard updates every interval",
+        config.iperf3.interval_s,
+    )
+    interval_n = 0
+    async for interval in runner.run_continuous(stop_event):
+        interval_n += 1
+
+        client_w = client_poller.window(interval.t_start_mono, interval.t_end_mono)
+        frr_w = frr_poller.window(interval.t_start_mono, interval.t_end_mono)
+        server_w = server_poller.window(interval.t_start_mono, interval.t_end_mono)
+
+        # Synthesise an Iperf3Result so analyze_run() can stay direction-aware
+        result = Iperf3Result(
+            started=True,
+            success=True,
+            t_start_mono=interval.t_start_mono,
+            t_end_mono=interval.t_end_mono,
+            duration_s=interval.interval_s,
+            protocol=config.iperf3.protocol,
+            parallel_streams=config.iperf3.parallel_streams,
+            reverse=config.iperf3.reverse,
+            payload_bytes=interval.bytes,
+            goodput_mbps=interval.bitrate_mbps,
+            retransmits=interval.cumulative_retransmits,
+        )
+        analysis = analyze_run(
+            run_n=interval_n,
+            iperf_result=result,
+            client_deltas=client_w,
+            frr_deltas=frr_w,
+            server_deltas=server_w,
+            config=config,
+            client_iface=client_iface,
+            server_iface=server_iface,
+        )
+        dashboard.publish(analysis)
+
+        # Log every 10th interval to avoid spam
+        if interval_n % 10 == 1:
+            log.info(
+                "  iv #%d  goodput=%.0f  client=%.0f  frr=%.0f  server=%.0f  "
+                "loss=%.2f%%  retx=%d",
+                interval_n,
+                result.goodput_mbps,
+                analysis.client.bulk_mbps if analysis.client else 0,
+                analysis.frr.bulk_mbps if analysis.frr else 0,
+                analysis.server.bulk_mbps if analysis.server else 0,
+                analysis.e2e_loss_pct,
+                interval.retransmits,
+            )
+
+    log.info("Continuous run ended after %d intervals", interval_n)
 
 
 def main() -> int:
