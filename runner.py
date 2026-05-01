@@ -261,6 +261,13 @@ class RunAnalysis:
     tunnel_overhead_pct: float = 0.0   # (frr − client TX) / client TX
     e2e_loss_pct: float = 0.0          # (client TX − server RX) / client TX
 
+    # Loss localization: split e2e loss into west-of-FRR vs east-of-FRR.
+    # Negative tunnel_overhead (FRR saw fewer bytes than client TX) implies
+    # loss in the west path — most likely the West-side SD-WAN appliance.
+    # Whatever's left of e2e_loss is east-of-FRR loss.
+    west_loss_pct: float = 0.0         # loss between client NIC and FRR egress
+    east_loss_pct: float = 0.0         # loss between FRR egress and server NIC
+
 
 class Iperf3Runner:
     """Builds and executes iperf3 commands against the remote server."""
@@ -649,5 +656,19 @@ def analyze_run(
                 0.0,
                 ((client_bulk - server_bulk) / client_bulk) * 100.0,
             )
+
+    # Loss localization. Negative tunnel overhead (FRR saw fewer bytes than
+    # client) is a proxy for west-side loss. Clamp to e2e_loss_pct so the
+    # decomposition is physically consistent — total loss can't exceed what
+    # the server actually missed. Anything left over is east-side loss.
+    if analysis.tunnel_overhead_pct < 0:
+        raw_west = -analysis.tunnel_overhead_pct
+        analysis.west_loss_pct = min(raw_west, analysis.e2e_loss_pct)
+        analysis.east_loss_pct = max(
+            0.0, analysis.e2e_loss_pct - analysis.west_loss_pct
+        )
+    else:
+        analysis.west_loss_pct = 0.0
+        analysis.east_loss_pct = analysis.e2e_loss_pct
 
     return analysis

@@ -108,6 +108,8 @@ class Dashboard:
                 "tcp_ip_overhead_pct": round(r.tcp_ip_overhead_pct, 2),
                 "tunnel_overhead_pct": round(r.tunnel_overhead_pct, 2),
                 "e2e_loss_pct": round(r.e2e_loss_pct, 3),
+                "west_loss_pct": round(r.west_loss_pct, 3),
+                "east_loss_pct": round(r.east_loss_pct, 3),
                 "retransmits": r.iperf3.retransmits,
                 "lost_packets": r.iperf3.lost_packets,
                 "jitter_ms": round(r.iperf3.jitter_ms, 3),
