@@ -60,11 +60,11 @@
   main { padding: 16px 20px; }
   .row { display: grid; gap: 12px; margin-bottom: 12px; }
   .row.kpis-flow { grid-template-columns: repeat(4, 1fr); }
-  .row.kpis-overhead { grid-template-columns: repeat(3, 1fr); }
+  .row.kpis-overhead { grid-template-columns: repeat(5, 1fr); }
   .row.charts { grid-template-columns: 2fr 1fr; }
   @media (max-width: 1100px) {
     .row.kpis-flow { grid-template-columns: repeat(2, 1fr); }
-    .row.kpis-overhead { grid-template-columns: 1fr; }
+    .row.kpis-overhead { grid-template-columns: repeat(2, 1fr); }
     .row.charts { grid-template-columns: 1fr; }
   }
 
@@ -169,7 +169,7 @@
     </div>
   </div>
 
-  <!-- Per-hop overheads -->
+  <!-- Per-hop overheads + loss localization -->
   <div class="row kpis-overhead">
     <div class="card kpi good"><h2>TCP/IP Overhead</h2>
       <div><span class="value" id="kpi-tcpip">—</span><span class="unit">%</span></div>
@@ -185,6 +185,16 @@
       <div><span class="value" id="kpi-loss">—</span><span class="unit">%</span></div>
       <div class="avg"><span class="lbl">30s avg</span><b id="avg-loss">—</b>%</div>
       <div class="sub">(client TX − server RX) / client TX • normal ≈ 0%</div>
+    </div>
+    <div class="card kpi err"><h2>L_west (pre-FRR)</h2>
+      <div><span class="value" id="kpi-west">—</span><span class="unit">%</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-west">—</b>%</div>
+      <div class="sub">loss between client NIC and FRR egress</div>
+    </div>
+    <div class="card kpi warn"><h2>L_east (post-FRR)</h2>
+      <div><span class="value" id="kpi-east">—</span><span class="unit">%</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-east">—</b>%</div>
+      <div class="sub">loss between FRR egress and server NIC</div>
     </div>
   </div>
 
@@ -207,6 +217,11 @@
   </div>
 
   <div class="card" style="margin-bottom: 12px;">
+    <h2>Loss localization (30s avg, stacked)</h2>
+    <div class="chart-wrap" style="height: 180px;"><canvas id="loss-chart"></canvas></div>
+  </div>
+
+  <div class="card" style="margin-bottom: 12px;">
     <h2>Recent runs</h2>
     <table>
       <thead>
@@ -219,12 +234,14 @@
           <th class="num">TCP/IP %</th>
           <th class="num">Tunnel %</th>
           <th class="num">E2E Loss %</th>
+          <th class="num">L_west %</th>
+          <th class="num">L_east %</th>
           <th class="num">Retx</th>
           <th class="num">Loss</th>
           <th class="num">Jitter</th>
         </tr>
       </thead>
-      <tbody id="runs-tbody"><tr><td colspan="13" style="text-align:center;color:var(--text-2)">No runs yet.</td></tr></tbody>
+      <tbody id="runs-tbody"><tr><td colspan="15" style="text-align:center;color:var(--text-2)">No runs yet.</td></tr></tbody>
     </table>
   </div>
 </main>
@@ -329,6 +346,43 @@ const tunnelChart = new Chart(document.getElementById('tunnel-chart'), {
       y: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7785', callback: v => v + '%' }, beginAtZero: false },
     },
     elements: { point: { radius: 0 }, line: { tension: 0.15, borderWidth: 1.5 } },
+  },
+});
+
+const lossChart = new Chart(document.getElementById('loss-chart'), {
+  type: 'line',
+  data: { labels: [], datasets: [
+    {
+      label: 'L_west (pre-FRR)',
+      data: [],
+      borderColor: '#E24B4A',
+      backgroundColor: 'rgba(226,75,74,0.45)',
+      borderWidth: 1.5,
+      fill: 'origin',
+      tension: 0.2,
+      pointRadius: 0,
+    },
+    {
+      label: 'L_east (post-FRR)',
+      data: [],
+      borderColor: '#FFB454',
+      backgroundColor: 'rgba(255,180,84,0.45)',
+      borderWidth: 1.5,
+      fill: '-1',          // stack on top of previous dataset
+      tension: 0.2,
+      pointRadius: 0,
+    },
+  ] },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: { legend: { display: true, position: 'bottom', labels: { color: '#a8b3bf', boxWidth: 10, boxHeight: 2 } } },
+    scales: {
+      x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7785', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
+      y: { stacked: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7785', callback: v => v + '%' }, beginAtZero: true },
+    },
+    elements: { point: { radius: 0 }, line: { tension: 0.2, borderWidth: 1.5 } },
   },
 });
 
@@ -498,6 +552,8 @@ async function refresh() {
     document.getElementById('kpi-tcpip').textContent   = fmt(latest.tcp_ip_overhead_pct);
     document.getElementById('kpi-tunnel').textContent  = fmt(latest.tunnel_overhead_pct);
     document.getElementById('kpi-loss').textContent    = fmt(latest.e2e_loss_pct, 2);
+    document.getElementById('kpi-west').textContent    = fmt(latest.west_loss_pct, 2);
+    document.getElementById('kpi-east').textContent    = fmt(latest.east_loss_pct, 2);
   }
 
   // 30s trailing averages
@@ -515,6 +571,10 @@ async function refresh() {
     fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.tunnel_overhead_pct));
   document.getElementById('avg-loss').textContent =
     fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.e2e_loss_pct), 2);
+  document.getElementById('avg-west').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.west_loss_pct), 2);
+  document.getElementById('avg-east').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.east_loss_pct), 2);
   document.getElementById('kpi-client-sub').textContent =
     `${meta.client_data_iface} • ${meta.iperf3.reverse ? 'rx' : 'tx'}`;
   document.getElementById('kpi-frr-sub').textContent =
@@ -546,13 +606,26 @@ async function refresh() {
   );
   tunnelChart.update('none');
 
+  // ── Loss localization chart (30s avg, stacked area) ──
+  // Use 30s averages — per-second L_west/L_east is too noisy to be useful.
+  lossChart.data.labels = runLabels;
+  lossChart.data.datasets[0].data = rollingAvgSeries(
+    state.runs, AVG_WINDOW, r => r.west_loss_pct,
+  );
+  lossChart.data.datasets[1].data = rollingAvgSeries(
+    state.runs, AVG_WINDOW, r => r.east_loss_pct,
+  );
+  lossChart.update('none');
+
   // ── Runs table ──
   const tbody = document.getElementById('runs-tbody');
   if (!state.runs.length) {
-    tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--text-2)">No runs yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--text-2)">No runs yet.</td></tr>';
   } else {
     tbody.innerHTML = state.runs.slice(-30).reverse().map(r => {
       const lossClass = r.e2e_loss_pct > 0.5 ? 'err' : (r.e2e_loss_pct > 0.05 ? 'warn' : 'num');
+      const westClass = r.west_loss_pct > 0.5 ? 'err' : (r.west_loss_pct > 0.05 ? 'warn' : 'num');
+      const eastClass = r.east_loss_pct > 0.5 ? 'err' : (r.east_loss_pct > 0.05 ? 'warn' : 'num');
       const tunnelClass = (r.tunnel_overhead_pct < 5 || r.tunnel_overhead_pct > 25) ? 'warn' : 'num';
       return `
         <tr class="${r.success ? '' : 'failed'}">
@@ -566,6 +639,8 @@ async function refresh() {
           <td class="num">${fmt(r.tcp_ip_overhead_pct, 1)}</td>
           <td class="${tunnelClass}">${fmt(r.tunnel_overhead_pct, 1)}</td>
           <td class="${lossClass}">${fmt(r.e2e_loss_pct, 2)}</td>
+          <td class="${westClass}">${fmt(r.west_loss_pct, 2)}</td>
+          <td class="${eastClass}">${fmt(r.east_loss_pct, 2)}</td>
           <td class="num">${r.retransmits ?? '—'}</td>
           <td class="num">${r.lost_packets ?? '—'}</td>
           <td class="num">${fmt(r.jitter_ms, 2)}</td>
