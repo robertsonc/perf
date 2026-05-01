@@ -398,6 +398,14 @@ const LOSS_AVG_WINDOW = 60;
 const LOSS_UPDATE_MS = 5000;
 let _lossLastUpdate = 0;
 
+// Throttle the BIG numbers on the 5 overhead/loss cards. The 30s avg shifts
+// by ~(new_sample − old_sample)/30 every poll, which is small but visible.
+// We compute every second but only repaint the headline every 3s — the
+// number lands and holds long enough to read without your eye chasing it.
+// The "live" small text stays at 1Hz so the per-second value is still there.
+const KPI_UPDATE_MS = 3000;
+let _kpiLastUpdate = 0;
+
 function trailingAvg(arr, n, getter) {
   const slice = arr.slice(-n);
   if (!slice.length) return null;
@@ -577,12 +585,18 @@ async function refresh() {
   const avg_west   = trailingAvg(state.runs, AVG_WINDOW, r => r.west_loss_pct);
   const avg_east   = trailingAvg(state.runs, AVG_WINDOW, r => r.east_loss_pct);
 
-  document.getElementById('kpi-tcpip').textContent  = fmt(avg_tcpip);
-  document.getElementById('kpi-tunnel').textContent = fmt(avg_tunnel);
-  document.getElementById('kpi-loss').textContent   = fmt(avg_loss, 2);
-  document.getElementById('kpi-west').textContent   = fmt(avg_west, 2);
-  document.getElementById('kpi-east').textContent   = fmt(avg_east, 2);
+  // Throttle the BIG numbers (avg → kpi-X) so they don't redraw every poll.
+  const _kpiNow = Date.now();
+  if (_kpiNow - _kpiLastUpdate >= KPI_UPDATE_MS) {
+    _kpiLastUpdate = _kpiNow;
+    document.getElementById('kpi-tcpip').textContent  = fmt(avg_tcpip);
+    document.getElementById('kpi-tunnel').textContent = fmt(avg_tunnel);
+    document.getElementById('kpi-loss').textContent   = fmt(avg_loss, 2);
+    document.getElementById('kpi-west').textContent   = fmt(avg_west, 2);
+    document.getElementById('kpi-east').textContent   = fmt(avg_east, 2);
+  }
 
+  // Small "live" text stays at 1Hz — useful when you DO want the real-time view.
   if (latest) {
     document.getElementById('avg-tcpip').textContent  = fmt(latest.tcp_ip_overhead_pct);
     document.getElementById('avg-tunnel').textContent = fmt(latest.tunnel_overhead_pct);
