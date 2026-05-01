@@ -173,27 +173,27 @@
   <div class="row kpis-overhead">
     <div class="card kpi good"><h2>TCP/IP Overhead</h2>
       <div><span class="value" id="kpi-tcpip">—</span><span class="unit">%</span></div>
-      <div class="avg"><span class="lbl">30s avg</span><b id="avg-tcpip">—</b>%</div>
+      <div class="avg"><span class="lbl">live</span><b id="avg-tcpip">—</b>%</div>
       <div class="sub">(client TX − payload) / payload • ~3% normal, negative if TSO/GSO is on</div>
     </div>
     <div class="card kpi warn"><h2>Tunnel Overhead</h2>
       <div><span class="value" id="kpi-tunnel">—</span><span class="unit">%</span></div>
-      <div class="avg"><span class="lbl">30s avg</span><b id="avg-tunnel">—</b>%</div>
+      <div class="avg"><span class="lbl">live</span><b id="avg-tunnel">—</b>%</div>
       <div class="sub">(FRR − client TX) / client TX • normal ≈ 10%</div>
     </div>
     <div class="card kpi err"><h2>End-to-End Loss</h2>
       <div><span class="value" id="kpi-loss">—</span><span class="unit">%</span></div>
-      <div class="avg"><span class="lbl">30s avg</span><b id="avg-loss">—</b>%</div>
+      <div class="avg"><span class="lbl">live</span><b id="avg-loss">—</b>%</div>
       <div class="sub">(client TX − server RX) / client TX • normal ≈ 0%</div>
     </div>
     <div class="card kpi err"><h2>L_west (pre-FRR)</h2>
       <div><span class="value" id="kpi-west">—</span><span class="unit">%</span></div>
-      <div class="avg"><span class="lbl">30s avg</span><b id="avg-west">—</b>%</div>
+      <div class="avg"><span class="lbl">live</span><b id="avg-west">—</b>%</div>
       <div class="sub">loss between client NIC and FRR egress</div>
     </div>
     <div class="card kpi warn"><h2>L_east (post-FRR)</h2>
       <div><span class="value" id="kpi-east">—</span><span class="unit">%</span></div>
-      <div class="avg"><span class="lbl">30s avg</span><b id="avg-east">—</b>%</div>
+      <div class="avg"><span class="lbl">live</span><b id="avg-east">—</b>%</div>
       <div class="sub">loss between FRR egress and server NIC</div>
     </div>
   </div>
@@ -217,7 +217,7 @@
   </div>
 
   <div class="card" style="margin-bottom: 12px;">
-    <h2>Loss localization (30s avg, stacked)</h2>
+    <h2>Loss localization (60s avg, stacked, refreshed every 5s)</h2>
     <div class="chart-wrap" style="height: 180px;"><canvas id="loss-chart"></canvas></div>
   </div>
 
@@ -356,20 +356,20 @@ const lossChart = new Chart(document.getElementById('loss-chart'), {
       label: 'L_west (pre-FRR)',
       data: [],
       borderColor: '#E24B4A',
-      backgroundColor: 'rgba(226,75,74,0.45)',
+      backgroundColor: 'rgba(226,75,74,0.28)',
       borderWidth: 1.5,
       fill: 'origin',
-      tension: 0.2,
+      tension: 0.3,
       pointRadius: 0,
     },
     {
       label: 'L_east (post-FRR)',
       data: [],
       borderColor: '#FFB454',
-      backgroundColor: 'rgba(255,180,84,0.45)',
+      backgroundColor: 'rgba(255,180,84,0.28)',
       borderWidth: 1.5,
       fill: '-1',          // stack on top of previous dataset
-      tension: 0.2,
+      tension: 0.3,
       pointRadius: 0,
     },
   ] },
@@ -382,13 +382,21 @@ const lossChart = new Chart(document.getElementById('loss-chart'), {
       x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7785', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
       y: { stacked: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7785', callback: v => v + '%' }, beginAtZero: true },
     },
-    elements: { point: { radius: 0 }, line: { tension: 0.2, borderWidth: 1.5 } },
+    elements: { point: { radius: 0 }, line: { tension: 0.3, borderWidth: 1.5 } },
   },
 });
 
 // Rolling-average helpers. Window size is in number of entries; with 1-second
 // intervals, AVG_WINDOW=30 means a 30-second trailing average.
 const AVG_WINDOW = 30;
+
+// Loss localization chart uses a wider window and throttles its redraw.
+// Per-second loss values are noisy and watching the stacked area shimmer is
+// distracting. 60s smoothing + 5s redraw cadence preserves the diagnostic
+// without the visual jitter.
+const LOSS_AVG_WINDOW = 60;
+const LOSS_UPDATE_MS = 5000;
+let _lossLastUpdate = 0;
 
 function trailingAvg(arr, n, getter) {
   const slice = arr.slice(-n);
@@ -544,19 +552,14 @@ async function refresh() {
 
   // ── KPIs ──
   const latest = state.runs.length ? state.runs[state.runs.length - 1] : null;
+
+  // Throughput cards: live = big, 30s avg = small (unchanged).
   if (latest) {
     document.getElementById('kpi-goodput').textContent = fmt(latest.goodput_mbps);
     document.getElementById('kpi-client').textContent  = fmt(latest.client_bulk_mbps);
     document.getElementById('kpi-frr').textContent     = fmt(latest.frr_bulk_mbps);
     document.getElementById('kpi-server').textContent  = fmt(latest.server_bulk_mbps);
-    document.getElementById('kpi-tcpip').textContent   = fmt(latest.tcp_ip_overhead_pct);
-    document.getElementById('kpi-tunnel').textContent  = fmt(latest.tunnel_overhead_pct);
-    document.getElementById('kpi-loss').textContent    = fmt(latest.e2e_loss_pct, 2);
-    document.getElementById('kpi-west').textContent    = fmt(latest.west_loss_pct, 2);
-    document.getElementById('kpi-east').textContent    = fmt(latest.east_loss_pct, 2);
   }
-
-  // 30s trailing averages
   document.getElementById('avg-goodput').textContent =
     fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.goodput_mbps));
   document.getElementById('avg-client').textContent =
@@ -565,16 +568,28 @@ async function refresh() {
     fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.frr_bulk_mbps));
   document.getElementById('avg-server').textContent =
     fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.server_bulk_mbps));
-  document.getElementById('avg-tcpip').textContent =
-    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.tcp_ip_overhead_pct));
-  document.getElementById('avg-tunnel').textContent =
-    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.tunnel_overhead_pct));
-  document.getElementById('avg-loss').textContent =
-    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.e2e_loss_pct), 2);
-  document.getElementById('avg-west').textContent =
-    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.west_loss_pct), 2);
-  document.getElementById('avg-east').textContent =
-    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.east_loss_pct), 2);
+
+  // Overhead and loss cards: 30s avg = big (steady), live = small (twitchy).
+  // The HTML 'value' element is always the big number; we just put avg there.
+  const avg_tcpip  = trailingAvg(state.runs, AVG_WINDOW, r => r.tcp_ip_overhead_pct);
+  const avg_tunnel = trailingAvg(state.runs, AVG_WINDOW, r => r.tunnel_overhead_pct);
+  const avg_loss   = trailingAvg(state.runs, AVG_WINDOW, r => r.e2e_loss_pct);
+  const avg_west   = trailingAvg(state.runs, AVG_WINDOW, r => r.west_loss_pct);
+  const avg_east   = trailingAvg(state.runs, AVG_WINDOW, r => r.east_loss_pct);
+
+  document.getElementById('kpi-tcpip').textContent  = fmt(avg_tcpip);
+  document.getElementById('kpi-tunnel').textContent = fmt(avg_tunnel);
+  document.getElementById('kpi-loss').textContent   = fmt(avg_loss, 2);
+  document.getElementById('kpi-west').textContent   = fmt(avg_west, 2);
+  document.getElementById('kpi-east').textContent   = fmt(avg_east, 2);
+
+  if (latest) {
+    document.getElementById('avg-tcpip').textContent  = fmt(latest.tcp_ip_overhead_pct);
+    document.getElementById('avg-tunnel').textContent = fmt(latest.tunnel_overhead_pct);
+    document.getElementById('avg-loss').textContent   = fmt(latest.e2e_loss_pct, 2);
+    document.getElementById('avg-west').textContent   = fmt(latest.west_loss_pct, 2);
+    document.getElementById('avg-east').textContent   = fmt(latest.east_loss_pct, 2);
+  }
   document.getElementById('kpi-client-sub').textContent =
     `${meta.client_data_iface} • ${meta.iperf3.reverse ? 'rx' : 'tx'}`;
   document.getElementById('kpi-frr-sub').textContent =
@@ -606,16 +621,22 @@ async function refresh() {
   );
   tunnelChart.update('none');
 
-  // ── Loss localization chart (30s avg, stacked area) ──
-  // Use 30s averages — per-second L_west/L_east is too noisy to be useful.
-  lossChart.data.labels = runLabels;
-  lossChart.data.datasets[0].data = rollingAvgSeries(
-    state.runs, AVG_WINDOW, r => r.west_loss_pct,
-  );
-  lossChart.data.datasets[1].data = rollingAvgSeries(
-    state.runs, AVG_WINDOW, r => r.east_loss_pct,
-  );
-  lossChart.update('none');
+  // ── Loss localization chart (60s avg, stacked area, throttled) ──
+  // Per-second L_west/L_east values are noisy enough that watching the
+  // stacked area redraw at 1Hz is distracting. Smooth wider (60s) and only
+  // repaint every LOSS_UPDATE_MS ms — the diagnostic stays just as readable.
+  const _now = Date.now();
+  if (_now - _lossLastUpdate >= LOSS_UPDATE_MS) {
+    _lossLastUpdate = _now;
+    lossChart.data.labels = runLabels;
+    lossChart.data.datasets[0].data = rollingAvgSeries(
+      state.runs, LOSS_AVG_WINDOW, r => r.west_loss_pct,
+    );
+    lossChart.data.datasets[1].data = rollingAvgSeries(
+      state.runs, LOSS_AVG_WINDOW, r => r.east_loss_pct,
+    );
+    lossChart.update('none');
+  }
 
   // ── Runs table ──
   const tbody = document.getElementById('runs-tbody');
