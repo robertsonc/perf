@@ -90,8 +90,16 @@
     font-size: 11px; color: var(--text-2);
     margin-top: 2px; font-variant-numeric: tabular-nums;
   }
+  .kpi .avg {
+    font-size: 12px; color: var(--text-1);
+    margin-top: 3px; font-variant-numeric: tabular-nums;
+  }
+  .kpi .avg b { color: var(--text-0); font-weight: 500; }
+  .kpi .avg .lbl { color: var(--text-2); margin-right: 4px; }
 
   .chart-wrap { position: relative; height: 280px; }
+  .chart-wrap.short { height: 130px; }
+  .charts-stack { display: grid; grid-template-rows: 1fr 1fr; gap: 12px; }
 
   table { width: 100%; border-collapse: collapse; }
   th, td {
@@ -141,18 +149,22 @@
   <div class="row kpis-flow">
     <div class="card kpi"><h2>iperf3 Goodput</h2>
       <div><span class="value" id="kpi-goodput">—</span><span class="unit">Mbps</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-goodput">—</b> Mbps</div>
       <div class="sub">application payload</div>
     </div>
     <div class="card kpi client"><h2>Client NIC</h2>
       <div><span class="value" id="kpi-client">—</span><span class="unit">Mbps</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-client">—</b> Mbps</div>
       <div class="sub" id="kpi-client-sub">—</div>
     </div>
     <div class="card kpi frr"><h2>FRR Underlay</h2>
       <div><span class="value" id="kpi-frr">—</span><span class="unit">Mbps</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-frr">—</b> Mbps</div>
       <div class="sub" id="kpi-frr-sub">—</div>
     </div>
     <div class="card kpi server"><h2>Server NIC</h2>
       <div><span class="value" id="kpi-server">—</span><span class="unit">Mbps</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-server">—</b> Mbps</div>
       <div class="sub" id="kpi-server-sub">—</div>
     </div>
   </div>
@@ -161,14 +173,17 @@
   <div class="row kpis-overhead">
     <div class="card kpi good"><h2>TCP/IP Overhead</h2>
       <div><span class="value" id="kpi-tcpip">—</span><span class="unit">%</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-tcpip">—</b>%</div>
       <div class="sub">(client TX − payload) / payload • ~3% normal, negative if TSO/GSO is on</div>
     </div>
     <div class="card kpi warn"><h2>Tunnel Overhead</h2>
       <div><span class="value" id="kpi-tunnel">—</span><span class="unit">%</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-tunnel">—</b>%</div>
       <div class="sub">(FRR − client TX) / client TX • normal ≈ 10%</div>
     </div>
     <div class="card kpi err"><h2>End-to-End Loss</h2>
       <div><span class="value" id="kpi-loss">—</span><span class="unit">%</span></div>
+      <div class="avg"><span class="lbl">30s avg</span><b id="avg-loss">—</b>%</div>
       <div class="sub">(client TX − server RX) / client TX • normal ≈ 0%</div>
     </div>
   </div>
@@ -179,9 +194,15 @@
       <div class="legend" id="wire-legend"></div>
       <div class="chart-wrap"><canvas id="wire-chart"></canvas></div>
     </div>
-    <div class="card">
-      <h2>Goodput per run</h2>
-      <div class="chart-wrap"><canvas id="goodput-chart"></canvas></div>
+    <div class="charts-stack">
+      <div class="card">
+        <h2>Goodput — live + 30s avg</h2>
+        <div class="chart-wrap short"><canvas id="goodput-chart"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Tunnel overhead — live + 30s avg</h2>
+        <div class="chart-wrap short"><canvas id="tunnel-chart"></canvas></div>
+      </div>
     </div>
   </div>
 
@@ -251,17 +272,101 @@ const wireChart = new Chart(document.getElementById('wire-chart'), {
 
 const goodputChart = new Chart(document.getElementById('goodput-chart'), {
   type: 'line',
-  data: { labels: [], datasets: [{
-    label: 'Goodput',
-    data: [],
-    borderColor: '#ffffff',
-    backgroundColor: 'rgba(255,255,255,0.05)',
-    fill: true,
-    tension: 0,
-    pointRadius: 2,
-  }] },
-  options: { ...baseChartOpts, elements: { point: { radius: 2 }, line: { tension: 0, borderWidth: 1.5 } } },
+  data: { labels: [], datasets: [
+    {
+      label: 'Live',
+      data: [],
+      borderColor: 'rgba(255,255,255,0.35)',
+      borderWidth: 1,
+      fill: false,
+      tension: 0,
+      pointRadius: 0,
+    },
+    {
+      label: '30s avg',
+      data: [],
+      borderColor: '#ffffff',
+      borderWidth: 2.5,
+      fill: false,
+      tension: 0.2,
+      pointRadius: 0,
+    },
+  ] },
+  options: {
+    ...baseChartOpts,
+    plugins: { legend: { display: true, position: 'bottom', labels: { color: '#a8b3bf', boxWidth: 10, boxHeight: 2 } } },
+    elements: { point: { radius: 0 }, line: { tension: 0.15, borderWidth: 1.5 } },
+  },
 });
+
+const tunnelChart = new Chart(document.getElementById('tunnel-chart'), {
+  type: 'line',
+  data: { labels: [], datasets: [
+    {
+      label: 'Live',
+      data: [],
+      borderColor: 'rgba(255,180,84,0.35)',
+      borderWidth: 1,
+      fill: false,
+      tension: 0,
+      pointRadius: 0,
+    },
+    {
+      label: '30s avg',
+      data: [],
+      borderColor: '#ffb454',
+      borderWidth: 2.5,
+      fill: false,
+      tension: 0.2,
+      pointRadius: 0,
+    },
+  ] },
+  options: {
+    ...baseChartOpts,
+    plugins: { legend: { display: true, position: 'bottom', labels: { color: '#a8b3bf', boxWidth: 10, boxHeight: 2 } } },
+    scales: {
+      x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7785', maxRotation: 0, autoSkip: true, maxTicksLimit: 6 } },
+      y: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#6b7785', callback: v => v + '%' }, beginAtZero: false },
+    },
+    elements: { point: { radius: 0 }, line: { tension: 0.15, borderWidth: 1.5 } },
+  },
+});
+
+// Rolling-average helpers. Window size is in number of entries; with 1-second
+// intervals, AVG_WINDOW=30 means a 30-second trailing average.
+const AVG_WINDOW = 30;
+
+function trailingAvg(arr, n, getter) {
+  const slice = arr.slice(-n);
+  if (!slice.length) return null;
+  let sum = 0, count = 0;
+  for (const x of slice) {
+    const v = getter(x);
+    if (v !== null && v !== undefined && !Number.isNaN(v)) {
+      sum += v;
+      count++;
+    }
+  }
+  return count ? sum / count : null;
+}
+
+function rollingAvgSeries(arr, n, getter) {
+  // Returns an array of trailing-window averages, same length as `arr`.
+  const out = new Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    const start = Math.max(0, i - n + 1);
+    let sum = 0, count = 0;
+    for (let j = start; j <= i; j++) {
+      const v = getter(arr[j]);
+      if (v !== null && v !== undefined && !Number.isNaN(v)) {
+        sum += v;
+        count++;
+      }
+    }
+    out[i] = count ? sum / count : null;
+  }
+  return out;
+}
 
 let stopRequested = false;
 document.getElementById('stop-btn').addEventListener('click', async () => {
@@ -394,6 +499,22 @@ async function refresh() {
     document.getElementById('kpi-tunnel').textContent  = fmt(latest.tunnel_overhead_pct);
     document.getElementById('kpi-loss').textContent    = fmt(latest.e2e_loss_pct, 2);
   }
+
+  // 30s trailing averages
+  document.getElementById('avg-goodput').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.goodput_mbps));
+  document.getElementById('avg-client').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.client_bulk_mbps));
+  document.getElementById('avg-frr').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.frr_bulk_mbps));
+  document.getElementById('avg-server').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.server_bulk_mbps));
+  document.getElementById('avg-tcpip').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.tcp_ip_overhead_pct));
+  document.getElementById('avg-tunnel').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.tunnel_overhead_pct));
+  document.getElementById('avg-loss').textContent =
+    fmt(trailingAvg(state.runs, AVG_WINDOW, r => r.e2e_loss_pct), 2);
   document.getElementById('kpi-client-sub').textContent =
     `${meta.client_data_iface} • ${meta.iperf3.reverse ? 'rx' : 'tx'}`;
   document.getElementById('kpi-frr-sub').textContent =
@@ -408,10 +529,22 @@ async function refresh() {
   wireChart.update('none');
   updateLegend(aligned.datasets);
 
-  // ── Goodput per run ──
-  goodputChart.data.labels = state.runs.map(r => `#${r.run_n}`);
+  // ── Goodput chart (live + 30s avg) ──
+  const runLabels = state.runs.map(r => `#${r.run_n}`);
+  goodputChart.data.labels = runLabels;
   goodputChart.data.datasets[0].data = state.runs.map(r => r.goodput_mbps);
+  goodputChart.data.datasets[1].data = rollingAvgSeries(
+    state.runs, AVG_WINDOW, r => r.goodput_mbps,
+  );
   goodputChart.update('none');
+
+  // ── Tunnel overhead chart (live + 30s avg) ──
+  tunnelChart.data.labels = runLabels;
+  tunnelChart.data.datasets[0].data = state.runs.map(r => r.tunnel_overhead_pct);
+  tunnelChart.data.datasets[1].data = rollingAvgSeries(
+    state.runs, AVG_WINDOW, r => r.tunnel_overhead_pct,
+  );
+  tunnelChart.update('none');
 
   // ── Runs table ──
   const tbody = document.getElementById('runs-tbody');
