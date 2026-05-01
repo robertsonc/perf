@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SD-WAN Performance Analyzer</title>
+<style>
+  :root {
+    --bg-0: #0b1118;
+    --bg-1: #131a23;
+    --bg-2: #1a242f;
+    --border: #243140;
+    --text-0: #e6edf3;
+    --text-1: #a8b3bf;
+    --text-2: #6b7785;
+    --accent: #00b388;
+    --warn: #ff8800;
+    --err:  #d65151;
+    --info: #4ea8de;
+    --client:  #4ea8de;     /* blue   */
+    --frr:     #b58af0;     /* purple */
+    --server:  #00b388;     /* teal   */
+    --frr-2:   #ffb454;     /* amber for WAN1 */
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg-0); color: var(--text-0);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px; background: var(--bg-1);
+    border-bottom: 1px solid var(--border);
+  }
+  header .brand { display: flex; align-items: center; gap: 14px; }
+  header .logo {
+    width: 48px; height: 32px; background: var(--accent); color: #000;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 13px; border-radius: 2px;
+  }
+  header h1 { font-size: 16px; font-weight: 500; margin: 0; }
+  header .meta { font-size: 12px; color: var(--text-1); margin-top: 2px; }
+  header .status { display: flex; align-items: center; gap: 12px; }
+  header .pill {
+    padding: 4px 10px; border-radius: 999px; font-size: 11px;
+    border: 1px solid var(--border); background: var(--bg-2);
+  }
+  header .pill.proto { color: var(--info); }
+  header .pill.dir   { color: var(--accent); }
+  header .updated { font-size: 11px; color: var(--text-2); }
+  header button.stop {
+    background: #722; color: #fff; border: 1px solid #944;
+    padding: 6px 14px; border-radius: 4px; cursor: pointer;
+    font-size: 12px;
+  }
+  header button.stop:hover { background: #944; }
+  header button.stop:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  main { padding: 16px 20px; }
+  .row { display: grid; gap: 12px; margin-bottom: 12px; }
+  .row.kpis-flow { grid-template-columns: repeat(4, 1fr); }
+  .row.kpis-overhead { grid-template-columns: repeat(3, 1fr); }
+  .row.charts { grid-template-columns: 2fr 1fr; }
+  @media (max-width: 1100px) {
+    .row.kpis-flow { grid-template-columns: repeat(2, 1fr); }
+    .row.kpis-overhead { grid-template-columns: 1fr; }
+    .row.charts { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--bg-1); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px;
+  }
+  .card h2 {
+    font-size: 11px; font-weight: 500; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--text-1); margin: 0 0 10px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .kpi .value { font-size: 24px; font-weight: 500; color: var(--text-0); }
+  .kpi .unit  { font-size: 13px; color: var(--text-1); margin-left: 4px; }
+  .kpi .sub   { font-size: 11px; color: var(--text-2); margin-top: 2px; }
+  .kpi.client .value { color: var(--client); }
+  .kpi.frr    .value { color: var(--frr); }
+  .kpi.server .value { color: var(--server); }
+  .kpi.warn   .value { color: var(--warn); }
+  .kpi.err    .value { color: var(--err); }
+  .kpi.good   .value { color: var(--accent); }
+  .kpi .delta {
+    font-size: 11px; color: var(--text-2);
+    margin-top: 2px; font-variant-numeric: tabular-nums;
+  }
+
+  .chart-wrap { position: relative; height: 280px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    padding: 6px 10px; text-align: left; font-size: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    color: var(--text-1); font-weight: 500;
+    text-transform: uppercase; letter-spacing: 0.06em; font-size: 10px;
+  }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  tr.failed td { color: var(--err); }
+  td.warn { color: var(--warn); }
+  td.err { color: var(--err); }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; margin-bottom: 6px; }
+  .legend span { display: flex; align-items: center; gap: 5px; color: var(--text-1); }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  footer {
+    padding: 10px 20px; font-size: 11px; color: var(--text-2);
+    border-top: 1px solid var(--border); background: var(--bg-1);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="logo">HPE</div>
+    <div>
+      <h1>SD-WAN Performance Analyzer</h1>
+      <div class="meta" id="meta-line">connecting…</div>
+    </div>
+  </div>
+  <div class="status">
+    <span class="pill proto" id="pill-proto">—</span>
+    <span class="pill dir" id="pill-dir">—</span>
+    <span class="updated" id="updated">—</span>
+    <button class="stop" id="stop-btn">Stop test</button>
+  </div>
+</header>
+
+<main>
+  <!-- Flow KPIs: payload + 3 vantage points -->
+  <div class="row kpis-flow">
+    <div class="card kpi"><h2>iperf3 Goodput</h2>
+      <div><span class="value" id="kpi-goodput">—</span><span class="unit">Mbps</span></div>
+      <div class="sub">application payload</div>
+    </div>
+    <div class="card kpi client"><h2>Client NIC</h2>
+      <div><span class="value" id="kpi-client">—</span><span class="unit">Mbps</span></div>
+      <div class="sub" id="kpi-client-sub">—</div>
+    </div>
+    <div class="card kpi frr"><h2>FRR Underlay</h2>
+      <div><span class="value" id="kpi-frr">—</span><span class="unit">Mbps</span></div>
+      <div class="sub" id="kpi-frr-sub">—</div>
+    </div>
+    <div class="card kpi server"><h2>Server NIC</h2>
+      <div><span class="value" id="kpi-server">—</span><span class="unit">Mbps</span></div>
+      <div class="sub" id="kpi-server-sub">—</div>
+    </div>
+  </div>
+
+  <!-- Per-hop overheads -->
+  <div class="row kpis-overhead">
+    <div class="card kpi good"><h2>TCP/IP Overhead</h2>
+      <div><span class="value" id="kpi-tcpip">—</span><span class="unit">%</span></div>
+      <div class="sub">(client TX − payload) / payload • normal ≈ 3%</div>
+    </div>
+    <div class="card kpi warn"><h2>Tunnel Overhead</h2>
+      <div><span class="value" id="kpi-tunnel">—</span><span class="unit">%</span></div>
+      <div class="sub">(FRR − client TX) / client TX • normal ≈ 10%</div>
+    </div>
+    <div class="card kpi err"><h2>End-to-End Loss</h2>
+      <div><span class="value" id="kpi-loss">—</span><span class="unit">%</span></div>
+      <div class="sub">(client TX − server RX) / client TX • normal ≈ 0%</div>
+    </div>
+  </div>
+
+  <div class="row charts">
+    <div class="card">
+      <h2>Wire rate over time (1 Hz, all vantage points)</h2>
+      <div class="legend" id="wire-legend"></div>
+      <div class="chart-wrap"><canvas id="wire-chart"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Goodput per run</h2>
+      <div class="chart-wrap"><canvas id="goodput-chart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom: 12px;">
+    <h2>Recent runs</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>Time</th><th>Proto</th>
+          <th class="num">Goodput</th>
+          <th class="num">Client TX</th>
+          <th class="num">FRR Wire</th>
+          <th class="num">Server RX</th>
+          <th class="num">TCP/IP %</th>
+          <th class="num">Tunnel %</th>
+          <th class="num">E2E Loss %</th>
+          <th class="num">Retx</th>
+          <th class="num">Loss</th>
+          <th class="num">Jitter</th>
+        </tr>
+      </thead>
+      <tbody id="runs-tbody"><tr><td colspan="13" style="text-align:center;color:var(--text-2)">No runs yet.</td></tr></tbody>
+    </table>
+  </div>
+</main>
+
+<footer id="footer">Pollers idle.</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+const COLORS = {
+  client:  '#4ea8de',
+  frr:     '#b58af0',
+  frr2:    '#ffb454',
+  server:  '#00b388',
+};
+
+function fmt(n, dp = 1) {
+  if (n === null || n === undefined || Number.isNaN(n)) return '—';
+  return Number(n).toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+const baseChartOpts = {
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: false,
+  plugins: { legend: { display: false } },
+  scales: {
+    x: {
+      grid: { color: 'rgba(255,255,255,0.04)' },
+      ticks: { color: '#6b7785', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
+    },
+    y: {
+      grid: { color: 'rgba(255,255,255,0.04)' },
+      ticks: { color: '#6b7785' },
+      beginAtZero: true,
+    },
+  },
+  elements: { point: { radius: 0 }, line: { tension: 0.15, borderWidth: 1.5 } },
+};
+
+const wireChart = new Chart(document.getElementById('wire-chart'), {
+  type: 'line',
+  data: { labels: [], datasets: [] },
+  options: baseChartOpts,
+});
+
+const goodputChart = new Chart(document.getElementById('goodput-chart'), {
+  type: 'line',
+  data: { labels: [], datasets: [{
+    label: 'Goodput',
+    data: [],
+    borderColor: '#ffffff',
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    fill: true,
+    tension: 0,
+    pointRadius: 2,
+  }] },
+  options: { ...baseChartOpts, elements: { point: { radius: 2 }, line: { tension: 0, borderWidth: 1.5 } } },
+});
+
+let stopRequested = false;
+document.getElementById('stop-btn').addEventListener('click', async () => {
+  if (stopRequested) return;
+  stopRequested = true;
+  document.getElementById('stop-btn').disabled = true;
+  try { await fetch('/api/stop', { method: 'POST' }); } catch (e) { /* swallow */ }
+});
+
+function updateLegend(datasets) {
+  const legend = document.getElementById('wire-legend');
+  legend.innerHTML = '';
+  for (const ds of datasets) {
+    const span = document.createElement('span');
+    span.innerHTML = `<i style="background:${ds.borderColor}"></i>${ds.label}`;
+    legend.appendChild(span);
+  }
+}
+
+// Build a unified time axis across all three sources by aligning on monotonic
+// timestamps (rounded to the nearest second).
+function buildAlignedSeries(state) {
+  const meta = state.meta;
+  const ws = state.wire_series;
+  const reverse = !!meta.iperf3.reverse;
+  const dual = !!meta.dual_wan;
+
+  // Normalise: each "stream" is { color, label, dir: 'tx'|'rx', iface, source: 'client'|'frr'|'server' }
+  const streams = [];
+
+  // Client stream: bulk direction (TX for upload, RX for reverse)
+  streams.push({
+    label: `Client ${meta.client_data_iface} ${reverse ? 'RX' : 'TX'}`,
+    color: COLORS.client,
+    source: 'client',
+    iface: meta.client_data_iface,
+    key: reverse ? 'rx_mbps' : 'tx_mbps',
+  });
+
+  // FRR egress stream(s): bulk forward direction (TX for upload, RX for reverse)
+  meta.interfaces.egress.forEach((iface, i) => {
+    streams.push({
+      label: `FRR ${iface} ${reverse ? 'RX' : 'TX'}`,
+      color: i === 0 ? COLORS.frr : COLORS.frr2,
+      source: 'frr',
+      iface,
+      key: reverse ? 'rx_mbps' : 'tx_mbps',
+    });
+  });
+
+  // Server stream: bulk direction (RX for upload, TX for reverse)
+  streams.push({
+    label: `Server ${meta.server_data_iface} ${reverse ? 'TX' : 'RX'}`,
+    color: COLORS.server,
+    source: 'server',
+    iface: meta.server_data_iface,
+    key: reverse ? 'tx_mbps' : 'rx_mbps',
+  });
+
+  // Build a sample-aligned label set from the FRR series timestamps
+  // (FRR is the most reliable timeline anchor).
+  const anchor = ws.frr || [];
+  const labels = anchor.map(s => {
+    // s.t is a monotonic clock value; convert to wallclock-like display
+    return new Date(performance.timeOrigin + (s.t * 1000)).toLocaleTimeString();
+  });
+
+  // For each stream, look up the rate at each anchor timestamp from its source.
+  // Snap to the nearest sample within ±1.5s — the pollers run independently so
+  // their ticks won't be perfectly aligned.
+  const datasets = streams.map(stream => {
+    const series = ws[stream.source] || [];
+    const data = anchor.map(anchorSample => {
+      // Find closest sample in stream.source within ±1.5s
+      let best = null;
+      let bestDt = Infinity;
+      for (const s of series) {
+        const dt = Math.abs(s.t - anchorSample.t);
+        if (dt < bestDt) { bestDt = dt; best = s; }
+      }
+      if (!best || bestDt > 1.5) return null;
+      const rates = best.rates[stream.iface];
+      return rates ? rates[stream.key] : null;
+    });
+    return {
+      label: stream.label,
+      data,
+      borderColor: stream.color,
+      backgroundColor: stream.color + '22',
+      fill: false,
+      spanGaps: true,
+    };
+  });
+
+  return { labels, datasets, streams };
+}
+
+async function refresh() {
+  let state;
+  try {
+    const r = await fetch('/api/state');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    state = await r.json();
+  } catch (e) {
+    document.getElementById('updated').textContent = 'connection error';
+    return;
+  }
+
+  const meta = state.meta;
+  document.getElementById('meta-line').textContent =
+    `${meta.appliance.toUpperCase()} • ${meta.appliance_desc} • ` +
+    `${meta.client_data_ip} (${meta.client_data_iface}) → ` +
+    `${meta.server_data_ip} (${meta.server_data_iface}) ` +
+    `via FRR ${meta.frr_mgmt_ip}`;
+  document.getElementById('pill-proto').textContent =
+    `${meta.iperf3.protocol.toUpperCase()} P=${meta.iperf3.parallel_streams}`;
+  document.getElementById('pill-dir').textContent =
+    meta.iperf3.reverse ? '↓ download' : '↑ upload';
+  document.getElementById('updated').textContent =
+    'Updated: ' + new Date().toLocaleTimeString();
+
+  // ── KPIs ──
+  const latest = state.runs.length ? state.runs[state.runs.length - 1] : null;
+  if (latest) {
+    document.getElementById('kpi-goodput').textContent = fmt(latest.goodput_mbps);
+    document.getElementById('kpi-client').textContent  = fmt(latest.client_bulk_mbps);
+    document.getElementById('kpi-frr').textContent     = fmt(latest.frr_bulk_mbps);
+    document.getElementById('kpi-server').textContent  = fmt(latest.server_bulk_mbps);
+    document.getElementById('kpi-tcpip').textContent   = fmt(latest.tcp_ip_overhead_pct);
+    document.getElementById('kpi-tunnel').textContent  = fmt(latest.tunnel_overhead_pct);
+    document.getElementById('kpi-loss').textContent    = fmt(latest.e2e_loss_pct, 2);
+  }
+  document.getElementById('kpi-client-sub').textContent =
+    `${meta.client_data_iface} • ${meta.iperf3.reverse ? 'rx' : 'tx'}`;
+  document.getElementById('kpi-frr-sub').textContent =
+    `${meta.interfaces.egress.join(', ')} • bulk dir`;
+  document.getElementById('kpi-server-sub').textContent =
+    `${meta.server_data_iface} • ${meta.iperf3.reverse ? 'tx' : 'rx'}`;
+
+  // ── Wire chart ──
+  const aligned = buildAlignedSeries(state);
+  wireChart.data.labels = aligned.labels;
+  wireChart.data.datasets = aligned.datasets;
+  wireChart.update('none');
+  updateLegend(aligned.datasets);
+
+  // ── Goodput per run ──
+  goodputChart.data.labels = state.runs.map(r => `#${r.run_n}`);
+  goodputChart.data.datasets[0].data = state.runs.map(r => r.goodput_mbps);
+  goodputChart.update('none');
+
+  // ── Runs table ──
+  const tbody = document.getElementById('runs-tbody');
+  if (!state.runs.length) {
+    tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--text-2)">No runs yet.</td></tr>';
+  } else {
+    tbody.innerHTML = state.runs.slice(-30).reverse().map(r => {
+      const lossClass = r.e2e_loss_pct > 0.5 ? 'err' : (r.e2e_loss_pct > 0.05 ? 'warn' : 'num');
+      const tunnelClass = (r.tunnel_overhead_pct < 5 || r.tunnel_overhead_pct > 25) ? 'warn' : 'num';
+      return `
+        <tr class="${r.success ? '' : 'failed'}">
+          <td>${r.run_n}</td>
+          <td>${r.t}</td>
+          <td>${r.protocol.toUpperCase()}${r.reverse ? ' -R' : ''} P=${r.streams}</td>
+          <td class="num">${fmt(r.goodput_mbps, 1)}</td>
+          <td class="num">${fmt(r.client_bulk_mbps, 1)}</td>
+          <td class="num">${fmt(r.frr_bulk_mbps, 1)}</td>
+          <td class="num">${fmt(r.server_bulk_mbps, 1)}</td>
+          <td class="num">${fmt(r.tcp_ip_overhead_pct, 1)}</td>
+          <td class="${tunnelClass}">${fmt(r.tunnel_overhead_pct, 1)}</td>
+          <td class="${lossClass}">${fmt(r.e2e_loss_pct, 2)}</td>
+          <td class="num">${r.retransmits ?? '—'}</td>
+          <td class="num">${r.lost_packets ?? '—'}</td>
+          <td class="num">${fmt(r.jitter_ms, 2)}</td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  document.getElementById('footer').textContent =
+    `Pollers @ ${meta.poller_interval_s}s • ` +
+    `client: ${(state.wire_series.client||[]).length} samples • ` +
+    `frr: ${(state.wire_series.frr||[]).length} samples • ` +
+    `server: ${(state.wire_series.server||[]).length} samples • ` +
+    `FRR ifaces: ${meta.interfaces.ingress.concat(meta.interfaces.egress).join(', ')}`;
+}
+
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>

@@ -1,0 +1,74 @@
+# SD-WAN performance orchestrator configuration.
+#
+# Copy to config.yaml and edit. SSH keys preferred over passwords; if you must
+# use a password, set SDWAN_FRR_PASSWORD / SDWAN_SERVER_PASSWORD env vars
+# rather than putting them here.
+
+dashboard:
+  bind: "0.0.0.0"
+  port: 8080
+
+iperf3:
+  port: 5201
+  duration_s: 10
+  parallel_streams: 4
+  protocol: tcp                 # tcp | udp
+  reverse: false                # iperf3 -R (server → client)
+  cooldown_s: 1
+  # window_kib: 4096            # iperf3 -w (TCP only)
+  # mss_bytes: 1400             # iperf3 -M (TCP only)
+  # udp_bandwidth: "950M"       # iperf3 -b (UDP only, 0 = unlimited)
+  # udp_length: 1400            # iperf3 -l (UDP only)
+
+poller_interval_s: 1.0
+poller_buffer_size: 3600
+
+hosts:
+  client:
+    # The orchestrator runs here. SSH not required (we read /proc/net/dev locally).
+    mgmt_ip: "192.168.2.129"
+    data_ip: "10.1.1.2"
+    # data_iface: "ens160"      # optional; auto-detected from data_ip
+
+  server:
+    mgmt_ip: "192.168.2.127"
+    data_ip: "10.2.2.2"
+    # data_iface: "ens160"      # optional; auto-detected from data_ip
+    ssh_user: "aruba"
+    ssh_key_path: "~/.ssh/id_ed25519"
+    # ssh_password_env: "SDWAN_SERVER_PASSWORD"
+    iperf3_path: "iperf3"
+
+  frr:
+    mgmt_ip: "192.168.2.102"
+    ssh_user: "aruba"
+    ssh_key_path: "~/.ssh/id_ed25519"
+    #ssh_password_env: "SDWAN_FRR_PASSWORD"
+
+# Appliance-specific WAN interface mappings on the FRR.
+#   ingress = the FRR interface that receives bulk frames from the West-side
+#             (client-side) appliance.
+#   egress  = the FRR interface that transmits bulk frames toward the East-side
+#             (server-side) appliance.
+appliances:
+  ecv:
+    description: "HPE EdgeConnect (Silver Peak) EC-V"
+    wan0:
+      ingress_iface: "ens161"
+      egress_iface:  "ens193"
+    wan1:
+      ingress_iface: "ens162"
+      egress_iface:  "ens225"
+
+  ssr:
+    description: "Juniper Session Smart Router"
+    wan0:
+      ingress_iface: "ens192"
+      egress_iface:  "ens256"
+    wan1:
+      ingress_iface: "ens224"
+      egress_iface:  "ens257"
+
+active:
+  appliance: "ecv"
+  dual_wan: false
