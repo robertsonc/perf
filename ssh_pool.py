@@ -11,7 +11,6 @@ import logging
 import shlex
 import subprocess
 from dataclasses import dataclass
-from typing import Self
 
 import asyncssh
 
@@ -150,10 +149,12 @@ class ServerSession:
         return await self._conn.detect_iface_for_ip(ip)
 
     async def ensure_iperf3_server(self, port: int) -> None:
-        """Start (or restart) the iperf3 server in daemon mode on `port`."""
+        """Start (or restart) the iperf3 server in daemon mode on `port`.
+
+        We add `-i 1` so the server emits per-interval reports to its log.
+        The orchestrator can tail that log to get UDP loss/jitter live.
+        """
         log.info("Ensuring iperf3 server on %s:%d", self._conn.host.mgmt_ip, port)
-        # pkill against the exact path we'll start with — avoids killing other
-        # iperf3 invocations on the box.
         iperf3 = shlex.quote(self._iperf3)
         await self._conn.run(
             f"pkill -f {iperf3} || true",
@@ -161,7 +162,7 @@ class ServerSession:
         )
         await asyncio.sleep(0.5)
         cmd = (
-            f"{iperf3} -s -p {port} -D "
+            f"{iperf3} -s -p {port} -D -i 1 "
             f"--logfile /tmp/iperf3_{port}.log"
         )
         await self._conn.run(cmd, timeout=10.0)
@@ -181,6 +182,42 @@ class ServerSession:
                 f"Tail: {(tail.stdout or '').strip()}"
             )
         log.info("iperf3 server is running")
+
+    def server_log_path(self, port: int) -> str:
+        return f"/tmp/iperf3_{port}.log"
+
+    async def tail_log(
+        self, log_path: str, stop_event: asyncio.Event,
+    ):
+        """SSH `tail -F <log>` and yield each line as it arrives.
+
+        Uses asyncssh's persistent connection — no new SSH session per line.
+        `tail -F` (capital F) follows file rotations and waits if the file
+        doesn't exist yet.
+        """
+        if self._conn.client is None:
+            raise SshError("server: not connected")
+        # -n 0 = don't replay history, only new lines from now
+        proc = await self._conn.client.create_process(
+            f"tail -n 0 -F {shlex.quote(log_path)}"
+        )
+        try:
+            assert proc.stdout is not None
+            while not stop_event.is_set():
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if not line:
+                    break
+                yield line.rstrip("\n")
+        finally:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def stop_iperf3_server(self) -> None:
         log.info("Stopping iperf3 server")
@@ -206,7 +243,7 @@ class SshPool:
             iperf3_path=config.hosts.server.iperf3_path,
         )
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> "SshPool":
         await self._frr_conn.connect()
         await self._server_conn.connect()
         return self

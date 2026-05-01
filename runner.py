@@ -42,6 +42,23 @@ _BYTE_UNIT_MULT = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
 _BIT_UNIT_MULT_MBPS = {"": 1e-6, "K": 1e-3, "M": 1.0, "G": 1000.0}
 
 
+# Server-side UDP interval line, e.g.:
+#   [  5]   1.00-2.00   sec   119 MBytes  1.00 Gbits/sec  0.020 ms  3/85000 (0.0035%)
+#   [SUM]   1.00-2.00   sec   476 MBytes  3.99 Gbits/sec  0.020 ms  12/340000 (0.0035%)
+# Final summary lines have a trailing "sender"/"receiver" — those we skip.
+_UDP_SERVER_LINE_RE = re.compile(
+    r"^\[\s*(?:SUM|\d+)\]\s+"
+    r"(?P<t0>\d+(?:\.\d+)?)-(?P<t1>\d+(?:\.\d+)?)\s+sec\s+"
+    r"(?P<bytes>\d+(?:\.\d+)?)\s+(?P<bytes_unit>[KMGT]?)Bytes\s+"
+    r"(?P<rate>\d+(?:\.\d+)?)\s+(?P<rate_unit>[KMG]?)bits/sec\s+"
+    r"(?P<jitter>\d+(?:\.\d+)?)\s+ms\s+"
+    r"(?P<lost>\d+)/(?P<total>\d+)"
+    r"(?:\s+\([^)]*\))?"
+    r"(?:\s+(?P<role>sender|receiver))?"
+    r"\s*$"
+)
+
+
 @dataclass(slots=True)
 class Iperf3Result:
     """Parsed result of one iperf3 run."""
@@ -81,6 +98,101 @@ class Iperf3Interval:
     bitrate_mbps: float
     retransmits: int = 0
     cumulative_retransmits: int = 0
+
+
+@dataclass(slots=True)
+class UdpServerStats:
+    """Per-interval UDP stats from the iperf3 SERVER's log.
+
+    These are what the receiver actually saw — the only honest source of
+    UDP loss and jitter data during a test.
+    """
+    t_start_offset: float    # seconds since iperf3 client connected
+    t_end_offset: float
+    bitrate_mbps: float
+    jitter_ms: float
+    lost_packets: int
+    total_packets: int
+    seen_at_mono: float = 0.0    # when the orchestrator received this line
+
+    @property
+    def loss_pct(self) -> float:
+        if self.total_packets <= 0:
+            return 0.0
+        return (self.lost_packets / self.total_packets) * 100.0
+
+
+def _parse_udp_server_line(line: str) -> UdpServerStats | None:
+    """Parse one server-side UDP interval line."""
+    m = _UDP_SERVER_LINE_RE.match(line.strip())
+    if not m or m.group("role"):
+        return None
+    try:
+        t0 = float(m.group("t0"))
+        t1 = float(m.group("t1"))
+        rate_val = float(m.group("rate"))
+        rate_unit = (m.group("rate_unit") or "").upper()
+        jitter = float(m.group("jitter"))
+        lost = int(m.group("lost"))
+        total = int(m.group("total"))
+    except (ValueError, KeyError):
+        return None
+    return UdpServerStats(
+        t_start_offset=t0,
+        t_end_offset=t1,
+        bitrate_mbps=rate_val * _BIT_UNIT_MULT_MBPS.get(rate_unit, 1.0),
+        jitter_ms=jitter,
+        lost_packets=lost,
+        total_packets=total,
+    )
+
+
+class UdpServerMonitor:
+    """Tails the iperf3 server log and exposes the latest UDP receiver stats.
+
+    Caller passes an async iterator of log lines (typically from
+    ServerSession.tail_log). The monitor runs as a background task that
+    updates `latest` whenever it sees a parseable interval line.
+
+    For -P >1 we prefer [SUM] lines over per-stream lines (more accurate
+    aggregate). For -P 1 the per-stream line is the only thing we get.
+    """
+
+    def __init__(self, parallel_streams: int) -> None:
+        self._parallel_streams = parallel_streams
+        self.latest: UdpServerStats | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    async def run(self, line_source) -> None:
+        """Consume lines from the source until exhausted."""
+        try:
+            async for line in line_source:
+                stats = _parse_udp_server_line(line)
+                if stats is None:
+                    continue
+                # If multi-stream, only trust [SUM] lines
+                if self._parallel_streams > 1 and not line.lstrip().startswith("[SUM]"):
+                    continue
+                stats.seen_at_mono = time.monotonic()
+                self.latest = stats
+        except Exception as exc:  # noqa: BLE001
+            log.warning("UdpServerMonitor stopped: %s", exc)
+
+    def consume(self, line_source) -> asyncio.Task[None]:
+        """Start the monitor as a background task."""
+        self._task = asyncio.create_task(
+            self.run(line_source), name="udp-server-monitor",
+        )
+        return self._task
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._task = None
 
 
 def _parse_interval_line(

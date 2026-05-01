@@ -17,12 +17,13 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
 
 from config import Config, load_config
 from dashboard import Dashboard
 from poller import WirePoller, read_local_proc_net_dev
-from runner import Iperf3Result, Iperf3Runner, analyze_run
+from runner import Iperf3Result, Iperf3Runner, UdpServerMonitor, analyze_run
 from ssh_pool import SshError, SshPool, detect_local_iface_for_ip
 
 log = logging.getLogger("sdwan_perf")
@@ -181,7 +182,7 @@ async def _run(config: Config) -> int:
         try:
             if config.iperf3.continuous:
                 await _run_continuous(
-                    config, runner,
+                    config, runner, pool,
                     client_poller, frr_poller, server_poller,
                     client_iface, server_iface,
                     dashboard, stop_event,
@@ -274,6 +275,7 @@ async def _run_burst(
 async def _run_continuous(
     config: Config,
     runner: Iperf3Runner,
+    pool: SshPool,
     client_poller, frr_poller, server_poller,
     client_iface: str, server_iface: str,
     dashboard, stop_event: asyncio.Event,
@@ -283,53 +285,90 @@ async def _run_continuous(
         "Continuous mode: iperf3 -i %ds, dashboard updates every interval",
         config.iperf3.interval_s,
     )
-    interval_n = 0
-    async for interval in runner.run_continuous(stop_event):
-        interval_n += 1
 
-        client_w = client_poller.window(interval.t_start_mono, interval.t_end_mono)
-        frr_w = frr_poller.window(interval.t_start_mono, interval.t_end_mono)
-        server_w = server_poller.window(interval.t_start_mono, interval.t_end_mono)
-
-        # Synthesise an Iperf3Result so analyze_run() can stay direction-aware
-        result = Iperf3Result(
-            started=True,
-            success=True,
-            t_start_mono=interval.t_start_mono,
-            t_end_mono=interval.t_end_mono,
-            duration_s=interval.interval_s,
-            protocol=config.iperf3.protocol,
+    # For UDP, tail the server's log to capture receiver-side loss/jitter.
+    # The iperf3 client doesn't see these per-interval.
+    udp_monitor: UdpServerMonitor | None = None
+    udp_tail_stop: asyncio.Event | None = None
+    if config.iperf3.protocol == "udp":
+        log_path = pool.server.server_log_path(config.iperf3.port)
+        udp_tail_stop = asyncio.Event()
+        udp_monitor = UdpServerMonitor(
             parallel_streams=config.iperf3.parallel_streams,
-            reverse=config.iperf3.reverse,
-            payload_bytes=interval.bytes,
-            goodput_mbps=interval.bitrate_mbps,
-            retransmits=interval.cumulative_retransmits,
         )
-        analysis = analyze_run(
-            run_n=interval_n,
-            iperf_result=result,
-            client_deltas=client_w,
-            frr_deltas=frr_w,
-            server_deltas=server_w,
-            config=config,
-            client_iface=client_iface,
-            server_iface=server_iface,
-        )
-        dashboard.publish(analysis)
+        udp_monitor.consume(pool.server.tail_log(log_path, udp_tail_stop))
+        log.info("UDP server log tail started: %s:%s",
+                 config.hosts.server.mgmt_ip, log_path)
 
-        # Log every 10th interval to avoid spam
-        if interval_n % 10 == 1:
-            log.info(
-                "  iv #%d  goodput=%.0f  client=%.0f  frr=%.0f  server=%.0f  "
-                "loss=%.2f%%  retx=%d",
-                interval_n,
-                result.goodput_mbps,
-                analysis.client.bulk_mbps if analysis.client else 0,
-                analysis.frr.bulk_mbps if analysis.frr else 0,
-                analysis.server.bulk_mbps if analysis.server else 0,
-                analysis.e2e_loss_pct,
-                interval.retransmits,
+    interval_n = 0
+    try:
+        async for interval in runner.run_continuous(stop_event):
+            interval_n += 1
+
+            client_w = client_poller.window(interval.t_start_mono, interval.t_end_mono)
+            frr_w = frr_poller.window(interval.t_start_mono, interval.t_end_mono)
+            server_w = server_poller.window(interval.t_start_mono, interval.t_end_mono)
+
+            # Synthesise an Iperf3Result so analyze_run() can stay direction-aware
+            result = Iperf3Result(
+                started=True,
+                success=True,
+                t_start_mono=interval.t_start_mono,
+                t_end_mono=interval.t_end_mono,
+                duration_s=interval.interval_s,
+                protocol=config.iperf3.protocol,
+                parallel_streams=config.iperf3.parallel_streams,
+                reverse=config.iperf3.reverse,
+                payload_bytes=interval.bytes,
+                goodput_mbps=interval.bitrate_mbps,
+                retransmits=interval.cumulative_retransmits,
             )
+
+            # Merge UDP receiver stats if available and recent (<3s old)
+            if udp_monitor is not None and udp_monitor.latest is not None:
+                stats = udp_monitor.latest
+                age = time.monotonic() - stats.seen_at_mono
+                if age < 3.0:
+                    result.lost_packets = stats.lost_packets
+                    result.total_packets = stats.total_packets
+                    result.jitter_ms = stats.jitter_ms
+
+            analysis = analyze_run(
+                run_n=interval_n,
+                iperf_result=result,
+                client_deltas=client_w,
+                frr_deltas=frr_w,
+                server_deltas=server_w,
+                config=config,
+                client_iface=client_iface,
+                server_iface=server_iface,
+            )
+            dashboard.publish(analysis)
+
+            if interval_n % 10 == 1:
+                udp_summary = ""
+                if udp_monitor is not None and udp_monitor.latest is not None:
+                    s = udp_monitor.latest
+                    udp_summary = (
+                        f"  udp_loss={s.loss_pct:.3f}% jitter={s.jitter_ms:.2f}ms"
+                    )
+                log.info(
+                    "  iv #%d  goodput=%.0f  client=%.0f  frr=%.0f  server=%.0f  "
+                    "loss=%.2f%%  retx=%d%s",
+                    interval_n,
+                    result.goodput_mbps,
+                    analysis.client.bulk_mbps if analysis.client else 0,
+                    analysis.frr.bulk_mbps if analysis.frr else 0,
+                    analysis.server.bulk_mbps if analysis.server else 0,
+                    analysis.e2e_loss_pct,
+                    interval.retransmits,
+                    udp_summary,
+                )
+    finally:
+        if udp_tail_stop is not None:
+            udp_tail_stop.set()
+        if udp_monitor is not None:
+            await udp_monitor.stop()
 
     log.info("Continuous run ended after %d intervals", interval_n)
 
