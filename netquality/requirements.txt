@@ -1,0 +1,5 @@
+# netquality has no third-party dependencies - it uses only the Python
+# standard library (socket, struct, threading, tkinter).
+#
+# Optional, only if you want to build a standalone .exe with build_exe.bat:
+# pyinstaller
