@@ -17,9 +17,10 @@ You run the *exact same program* on both machines. Each instance continuously
 Traffic flows **bi-directionally on every stream, all the time**. The UI updates
 in realtime and shows the connection's overall experience at a glance.
 
-The dashboard shows **two live + history charts** with one line per stream:
+The dashboard shows **three live + history charts** with one line per stream:
 
 - **Latency (RTT, ms)**
+- **Loss + late (%)**
 - **Jitter (ms)**
 
 plus, in the header:

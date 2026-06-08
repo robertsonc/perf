@@ -817,13 +817,17 @@ def run_gui(engine, args):
     tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
              font=(FONT, 9)).pack(side="left")
 
-    # ---- charts (latency + jitter only; fill the rest, resize freely) -----
+    # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
     charts = tk.Frame(root, bg=BG, padx=12, pady=6)
     charts.pack(fill="both", expand=True)
     lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0)
     lat_canvas.pack(fill="both", expand=True, pady=(0, 6))
-    jit_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0)
-    jit_canvas.pack(fill="both", expand=True)
+    bottom = tk.Frame(charts, bg=BG)
+    bottom.pack(fill="both", expand=True)
+    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
+    loss_canvas.pack(side="left", fill="both", expand=True, padx=(0, 3))
+    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
+    jit_canvas.pack(side="left", fill="both", expand=True, padx=(3, 0))
 
     def refresh():
         snap = engine.snapshot()
@@ -855,6 +859,9 @@ def run_gui(engine, args):
         _draw_chart(lat_canvas, "Latency (RTT, ms)", "rtt", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+        _draw_chart(loss_canvas, "Loss + late (%)", "loss", series, hist,
+                    view_seconds, now, ymin_floor=2.0, unit="%",
+                    value_fmt=lambda v: f"{v:.0f}")
         _draw_chart(jit_canvas, "Jitter (ms)", "jitter", series, hist,
                     view_seconds, now, ymin_floor=1.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
