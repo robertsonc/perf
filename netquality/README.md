@@ -1,8 +1,8 @@
-# netquality
+# Network Vitals
 
-A single, self-contained Python app that precisely measures **loss, latency and
-jitter** between two Windows workstations and rates the connection with a
-**quality score**.
+A single, self-contained Python app (`netquality.py`) that precisely measures
+**loss, latency and jitter** between two Windows workstations and rates the
+connection with a **quality score**.
 
 You run the *exact same program* on both machines. Each instance continuously
 **sends and receives** four probe streams at once:
@@ -15,18 +15,26 @@ You run the *exact same program* on both machines. Each instance continuously
 | TCP-5102  | TCP      | 5102 |
 
 Traffic flows **bi-directionally on every stream, all the time**. The UI updates
-in realtime with per-stream loss / RTT / one-way latency / jitter, plus an
-overall connection quality score and MOS estimate.
+in realtime and shows the connection's overall experience at a glance.
 
-The HPE-themed dashboard shows **live + history charts** (latency, loss, jitter)
-alongside a per-stream table:
+The dashboard shows **three live + history charts** with one line per stream:
 
-- **Latency (RTT, ms)** — one line per stream
-- **Loss + late (%)** — effective impairment per stream
-- **Jitter (ms)** — per stream
-- a big colour-coded **overall quality score** (green = excellent → red = bad)
+- **Latency (RTT, ms)**
+- **Loss + late (%)**
+- **Jitter (ms)**
 
-Charts keep a rolling history (default 5 minutes, `--history`).
+plus, in the header:
+
+- a big colour-coded **Experience score** (0–100, green = excellent → red = bad),
+- a composite **MOS (avg)** — the average MOS across the active streams,
+- a **Reset / Clear** button that wipes the charts and all accumulated
+  loss/latency/jitter stats so a demo can start from a clean slate.
+
+Charts keep a rolling history (default 5 minutes, `--history`). The window
+resizes freely; the charts grow and shrink with it.
+
+> Loss is still measured per stream and folded into the score (as `loss + late`,
+> see below) — it's just not shown as its own chart/table anymore.
 
 ## Requirements
 
@@ -102,6 +110,25 @@ For the **quality score**, `loss + late` is treated as the effective impairment
 way), but the two are reported separately so you can see which is happening.
 Raise `--timeout` if you want to tolerate slower paths before counting late/lost;
 lower it to be stricter about latency deadlines.
+
+#### Why a *clean* link can show a little UDP loss (and impairment makes it vanish)
+
+A counterintuitive thing you may see: a low-jitter path shows a small amount of
+**UDP** loss, while adding jitter/delay impairment drives it to ~0. TCP streams
+never show it. The cause is **microbursts**, not the wire:
+
+- The OS thread scheduler / timer granularity (≈15 ms on Windows) makes the
+  paced probes actually leave in small bursts rather than evenly spaced.
+- On a clean, low-jitter path those bursts arrive **still bunched**, and a burst
+  can momentarily overrun the socket receive buffer — a dropped datagram that
+  looks like loss. (TCP can't show this; the kernel retransmits invisibly.)
+- A jitter/delay impairment box **spreads packets out in time** (and buffers
+  rather than drops), which *de-bursts* the arrivals — so the buffer never
+  overruns and loss falls to zero.
+
+To keep this local artifact out of the measurement, netquality enlarges the UDP
+socket send/receive buffers to a few MB (`SOCK_BUF_BYTES`), which absorbs the
+microbursts so reported loss reflects the path, not a local buffer overflow.
 
 Because both instances originate probes *and* reflect the peer's probes on the
 same ports, every stream carries traffic in both directions continuously. For
