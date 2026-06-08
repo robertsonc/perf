@@ -1,8 +1,8 @@
-# netquality
+# Network Vitals
 
-A single, self-contained Python app that precisely measures **loss, latency and
-jitter** between two Windows workstations and rates the connection with a
-**quality score**.
+A single, self-contained Python app (`netquality.py`) that precisely measures
+**loss, latency and jitter** between two Windows workstations and rates the
+connection with a **quality score**.
 
 You run the *exact same program* on both machines. Each instance continuously
 **sends and receives** four probe streams at once:

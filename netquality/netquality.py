@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-netquality - bidirectional network quality probe between two workstations.
+Network Vitals (netquality.py) - bidirectional network quality probe between
+two workstations.
 
 A single, self-contained, dependency-free Python app. Run the SAME program on
 both workstations. Each instance continuously sends AND receives:
@@ -764,7 +765,7 @@ def run_gui(engine, args):
               for sid, proto, port, name in STREAMS]
 
     root = tk.Tk()
-    root.title(f"Network Quality Monitor  -  peer {args.peer}")
+    root.title(f"Network Vitals  -  peer {args.peer}")
     root.geometry("1000x600")
     root.minsize(480, 320)
     root.configure(bg=BG)
@@ -792,7 +793,7 @@ def run_gui(engine, args):
     ekg.pack(side="left", padx=(0, 10))
     _draw_ekg(ekg)
 
-    tk.Label(header, text="Network Quality Monitor", fg=TXT, bg=BG,
+    tk.Label(header, text="Network Vitals", fg=TXT, bg=BG,
              font=(FONT, 17, "bold")).pack(side="left", anchor="w")
 
     def do_reset():
@@ -904,7 +905,7 @@ def run_gui(engine, args):
 # Console UI (fallback when no display / --no-gui)
 # ---------------------------------------------------------------------------
 def run_console(engine, args):
-    print(f"netquality  peer={args.peer}  bind={args.bind}  "
+    print(f"Network Vitals  peer={args.peer}  bind={args.bind}  "
           f"UDP 5201/5202  TCP 5101/5102  {args.pps} probes/s/stream")
     print("Ctrl-C to stop.\n")
     try:
