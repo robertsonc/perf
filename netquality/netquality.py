@@ -966,6 +966,32 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def set_timer_resolution(period_ms):
+    """Request a finer Windows scheduler tick (default ~15.6 ms -> period_ms).
+
+    Smooth probe pacing instead of clumpy ~15 ms bursts, which is what causes
+    occasional UDP receive-buffer drops on an otherwise-clean path. No-op (and
+    harmless) on non-Windows platforms. Returns True if it was applied.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return ctypes.windll.winmm.timeBeginPeriod(int(period_ms)) == 0
+    except Exception:
+        return False
+
+
+def clear_timer_resolution(period_ms):
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.winmm.timeEndPeriod(int(period_ms))
+    except Exception:
+        pass
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.size < HEADER_LEN:
@@ -973,6 +999,7 @@ def main(argv=None):
     if args.pps < 1:
         args.pps = 1
 
+    set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
     engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
                     args.timeout, history_seconds=args.history)
     engine.start()
@@ -985,16 +1012,18 @@ def main(argv=None):
             use_gui = False
             print("Tkinter not available - falling back to console UI.", file=sys.stderr)
 
-    if use_gui:
-        try:
-            run_gui(engine, args)
-        except Exception as e:  # e.g. no display on a headless host
-            print(f"GUI unavailable ({e}) - falling back to console UI.", file=sys.stderr)
+    try:
+        if use_gui:
+            try:
+                run_gui(engine, args)
+            except Exception as e:  # e.g. no display on a headless host
+                print(f"GUI unavailable ({e}) - falling back to console UI.", file=sys.stderr)
+                run_console(engine, args)
+        else:
             run_console(engine, args)
-    else:
-        run_console(engine, args)
-
-    engine.shutdown()
+    finally:
+        engine.shutdown()
+        clear_timer_resolution(1)
 
 
 if __name__ == "__main__":
