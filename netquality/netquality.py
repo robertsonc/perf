@@ -89,51 +89,80 @@ def parse_header(data):
 # Per-stream statistics (thread-safe, sliding window)
 # ---------------------------------------------------------------------------
 class StreamStats:
-    """Rolling-window stats for one originated stream."""
+    """Rolling-window stats for one originated stream.
+
+    Loss accounting distinguishes three terminal outcomes for every probe:
+
+      * recv  - echo returned within `timeout` (on time).
+      * lost  - no echo within `timeout` and still none -> a real drop.
+      * late  - echo arrived AFTER the timeout deadline (reordered / over-
+                buffered). It physically came back, but too late to be useful
+                to a real-time stream, so it is reclassified lost -> late.
+
+    Loss% and Late% are computed over the sliding `window`; the quality score
+    treats (loss + late) as the effective impairment.
+    """
 
     def __init__(self, window=10.0, timeout=2.0):
         self.lock = threading.Lock()
         self.window = window          # seconds of history kept for rates/loss
         self.timeout = timeout        # an un-echoed probe older than this = lost
 
-        self.rtt_samples = deque()    # (t_wall, rtt_ms)
-        self.recv_events = deque()    # t_wall of echoes received
-        self.lost_events = deque()    # t_wall of probes declared lost
+        self.rtt_samples = deque()    # (t_wall, rtt_ms) for on-time echoes only
         self.tx_events = deque()      # t_wall of probes sent
 
-        self.pending = {}             # seq -> send monotonic_ns
+        # Windowed per-probe outcomes. `resolved_order` keeps insertion order so
+        # we can trim by time; `state` maps seq -> 'recv'|'lost'|'late' and is
+        # updated in place when a lost probe is later reclassified as late.
+        self.resolved_order = deque() # (resolve_wall, seq)
+        self.state = {}               # seq -> outcome
+
+        self.pending = {}             # seq -> (send_wall, send_monotonic_ns)
         self.jitter = 0.0             # RFC-3550 style smoothed jitter (ms)
         self.last_rtt = None
-        self.last_echo_t = 0.0        # wallclock of most recent echo
-        self.total_tx = 0
-        self.total_rx = 0
-        self.total_lost = 0
+        self.last_echo_t = 0.0        # wallclock of most recent echo (any kind)
+
+        # cumulative session counters (for the footer / totals)
+        self.cum_tx = 0
+        self.cum_recv = 0
+        self.cum_lost = 0
+        self.cum_late = 0
 
     # -- producers (called from network threads) --------------------------
     def on_send(self, seq, send_ns):
         with self.lock:
-            self.pending[seq] = send_ns
+            self.pending[seq] = (time.time(), send_ns)
             self.tx_events.append(time.time())
-            self.total_tx += 1
+            self.cum_tx += 1
             self._trim_locked()
 
     def on_echo(self, seq, ts_ns, now_ns):
         with self.lock:
-            if self.pending.pop(seq, None) is None:
-                return  # duplicate or already-reaped echo
             rtt = (now_ns - ts_ns) / 1e6
             if rtt < 0:
                 rtt = 0.0
             now_w = time.time()
-            self.rtt_samples.append((now_w, rtt))
-            self.recv_events.append(now_w)
-            self.total_rx += 1
-            if self.last_rtt is not None:
-                d = abs(rtt - self.last_rtt)
-                # smoothed mean deviation, RFC 3550 J += (|D|-J)/16
-                self.jitter += (d - self.jitter) / 16.0
-            self.last_rtt = rtt
-            self.last_echo_t = now_w
+            p = self.pending.pop(seq, None)
+            if p is not None:
+                # On-time echo.
+                self.state[seq] = "recv"
+                self.resolved_order.append((now_w, seq))
+                self.rtt_samples.append((now_w, rtt))
+                self.cum_recv += 1
+                if self.last_rtt is not None:
+                    d = abs(rtt - self.last_rtt)
+                    # smoothed mean deviation, RFC 3550 J += (|D|-J)/16
+                    self.jitter += (d - self.jitter) / 16.0
+                self.last_rtt = rtt
+                self.last_echo_t = now_w
+            elif self.state.get(seq) == "lost":
+                # A previously reaped probe finally came back: it was late, not
+                # lost. Reclassify so Loss% drops and Late% rises.
+                self.state[seq] = "late"
+                self.cum_lost -= 1
+                self.cum_late += 1
+                self.last_echo_t = now_w
+            # else: duplicate, or so old it has been trimmed -> ignore.
             self._trim_locked()
 
     def reap(self):
@@ -141,11 +170,13 @@ class StreamStats:
         now_ns = time.monotonic_ns()
         cutoff = self.timeout * 1e9
         with self.lock:
-            dead = [s for s, ns in self.pending.items() if now_ns - ns > cutoff]
+            now_w = time.time()
+            dead = [s for s, (w, ns) in self.pending.items() if now_ns - ns > cutoff]
             for s in dead:
                 self.pending.pop(s, None)
-                self.lost_events.append(time.time())
-                self.total_lost += 1
+                self.state[s] = "lost"
+                self.resolved_order.append((now_w, s))
+                self.cum_lost += 1
             self._trim_locked()
 
     # -- consumer (called from UI thread) ---------------------------------
@@ -153,33 +184,46 @@ class StreamStats:
         with self.lock:
             self._trim_locked()
             rtts = [r for _, r in self.rtt_samples]
-            recv = len(self.recv_events)
-            lost = len(self.lost_events)
-            decided = recv + lost
+            recv = lost = late = 0
+            for st in self.state.values():
+                if st == "recv":
+                    recv += 1
+                elif st == "lost":
+                    lost += 1
+                else:
+                    late += 1
+            decided = recv + lost + late
             loss = (lost / decided * 100.0) if decided else 0.0
+            late_pct = (late / decided * 100.0) if decided else 0.0
             connected = (time.time() - self.last_echo_t) < self.timeout if self.last_echo_t else False
+            avg = (sum(rtts) / len(rtts)) if rtts else 0.0
             return {
                 "connected": connected,
-                "rtt_avg": (sum(rtts) / len(rtts)) if rtts else 0.0,
+                "rtt_avg": avg,
                 "rtt_min": min(rtts) if rtts else 0.0,
                 "rtt_max": max(rtts) if rtts else 0.0,
-                "latency": ((sum(rtts) / len(rtts)) / 2.0) if rtts else 0.0,
+                "latency": avg / 2.0,
                 "jitter": self.jitter,
                 "loss": loss,
+                "late": late_pct,
                 "tx_pps": len(self.tx_events) / self.window,
-                "rx_pps": len(self.recv_events) / self.window,
+                "rx_pps": recv / self.window,
                 "samples": len(rtts),
+                "cum_tx": self.cum_tx,
+                "cum_recv": self.cum_recv,
+                "cum_lost": self.cum_lost,
+                "cum_late": self.cum_late,
             }
 
     def _trim_locked(self):
         horizon = time.time() - self.window
-        for dq in (self.rtt_samples, self.recv_events, self.lost_events, self.tx_events):
-            if dq and isinstance(dq[0], tuple):
-                while dq and dq[0][0] < horizon:
-                    dq.popleft()
-            else:
-                while dq and dq[0] < horizon:
-                    dq.popleft()
+        while self.rtt_samples and self.rtt_samples[0][0] < horizon:
+            self.rtt_samples.popleft()
+        while self.tx_events and self.tx_events[0] < horizon:
+            self.tx_events.popleft()
+        while self.resolved_order and self.resolved_order[0][0] < horizon:
+            _, seq = self.resolved_order.popleft()
+            self.state.pop(seq, None)
 
 
 # ---------------------------------------------------------------------------
@@ -449,14 +493,18 @@ class TCPStream:
 # Engine: owns all streams + their stats
 # ---------------------------------------------------------------------------
 class Engine:
-    def __init__(self, peer, bind, size, pps, window, timeout):
+    def __init__(self, peer, bind, size, pps, window, timeout, history_seconds=300):
         self.peer = peer
         self.bind = bind
         self.stop = threading.Event()
         self.start_time = time.time()
+        self.history_seconds = history_seconds
         interval = 1.0 / pps
         self.stats = {}
         self.streams = []
+        # Per-second history ring buffer per stream, for the live/history charts.
+        self.history = {cfg[0]: deque(maxlen=history_seconds + 2) for cfg in STREAMS}
+        self.history_lock = threading.Lock()
         for cfg in STREAMS:
             sid, proto, port, name = cfg
             st = StreamStats(window=window, timeout=timeout)
@@ -469,9 +517,33 @@ class Engine:
     def start(self):
         for s in self.streams:
             s.start()
+        threading.Thread(target=self._sampler, name="history-sampler", daemon=True).start()
 
     def shutdown(self):
         self.stop.set()
+
+    def _sampler(self):
+        """Append one history sample per stream every second."""
+        while not self.stop.wait(1.0):
+            now = time.time()
+            with self.history_lock:
+                for sid in self.history:
+                    snap = self.stats[sid].snapshot()
+                    eff = min(100.0, snap["loss"] + snap["late"])
+                    r, _, _ = quality_score(snap["latency"], eff, snap["jitter"])
+                    up = snap["connected"]
+                    self.history[sid].append({
+                        "t": now,
+                        "rtt": snap["rtt_avg"] if up else None,
+                        "loss": min(100.0, snap["loss"] + snap["late"]),
+                        "jitter": snap["jitter"] if up else None,
+                        "score": r if up else None,
+                        "up": up,
+                    })
+
+    def history_copy(self):
+        with self.history_lock:
+            return {sid: list(dq) for sid, dq in self.history.items()}
 
     def snapshot(self):
         """Return per-stream snapshots + overall aggregate quality."""
@@ -479,7 +551,8 @@ class Engine:
         scores = []
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
-            r, mos, label = quality_score(snap["latency"], snap["loss"], snap["jitter"])
+            eff = min(100.0, snap["loss"] + snap["late"])  # late is as bad as lost for real-time
+            r, mos, label = quality_score(snap["latency"], eff, snap["jitter"])
             snap.update(sid=sid, proto=proto, port=port, name=name,
                         score=r, mos=mos, label=label)
             rows.append(snap)
@@ -502,76 +575,231 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------
-# Tkinter GUI
+# HPE-inspired theme + Canvas charts (no external dependencies)
+# ---------------------------------------------------------------------------
+HPE_GREEN = "#01A982"     # HPE signature green
+HPE_GREEN_DK = "#017a5e"
+BG = "#1a1d21"            # app background (HPE dark neutral)
+PANEL = "#23272e"        # cards / chart panels
+PANEL_HI = "#2c313a"
+GRID = "#363b44"
+TXT = "#f2f4f5"
+TXT_DIM = "#9aa3ad"
+FONT = "Segoe UI"
+
+# distinct, on-brand line colours per stream
+STREAM_COLORS = {0: "#01A982", 1: "#FF8300", 2: "#00B0E6", 3: "#FEC901"}
+
+
+def _nice_ceiling(v):
+    """Round a value up to a clean 1/2/2.5/5 * 10^n axis maximum."""
+    if v <= 0:
+        return 1.0
+    exp = math.floor(math.log10(v))
+    base = 10 ** exp
+    for m in (1, 2, 2.5, 5, 10):
+        if v <= m * base:
+            return m * base
+    return 10 * base
+
+
+def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
+                ymin_floor=1.0, unit="", value_fmt=None):
+    """Render one time-series chart onto a Tk Canvas.
+
+    series: list of (sid, color, short_label). samples_by_sid: {sid: [sample]}.
+    Each sample is {'t', key..., 'up'}; None values break the line (gap = down).
+    """
+    if value_fmt is None:
+        value_fmt = lambda v: f"{v:.0f}"
+    w = canvas.winfo_width()
+    h = canvas.winfo_height()
+    if w < 30 or h < 30:
+        return
+    canvas.delete("all")
+    canvas.create_rectangle(0, 0, w, h, fill=PANEL, outline=GRID)
+    pad_l, pad_r, pad_t, pad_b = 46, 12, 30, 20
+    pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
+    if pw < 10 or ph < 10:
+        return
+    title_id = canvas.create_text(12, 15, text=title, anchor="w", fill=TXT,
+                                  font=(FONT, 10, "bold"))
+    legend_x0 = canvas.bbox(title_id)[2] + 18  # start legend after the title
+
+    # autoscale Y
+    vmax = ymin_floor
+    for sid, _c, _n in series:
+        for s in samples_by_sid.get(sid, ()):
+            v = s.get(key)
+            if v is not None and s["up"]:
+                vmax = max(vmax, v)
+    vmax = _nice_ceiling(vmax)
+
+    # horizontal gridlines + Y labels
+    for i in range(5):
+        yy = pad_t + ph * i / 4.0
+        canvas.create_line(pad_l, yy, w - pad_r, yy, fill=GRID)
+        canvas.create_text(pad_l - 5, yy, text=value_fmt(vmax * (1 - i / 4.0)),
+                           anchor="e", fill=TXT_DIM, font=(FONT, 7))
+
+    t0 = now - view_seconds
+
+    def X(t):
+        return pad_l + pw * (t - t0) / max(1e-3, view_seconds)
+
+    def Y(v):
+        return pad_t + ph * (1 - min(1.0, max(0.0, v) / vmax))
+
+    # X axis time labels
+    for frac, lbl in ((0.0, f"-{int(view_seconds)}s"),
+                      (0.5, f"-{int(view_seconds / 2)}s"), (1.0, "now")):
+        canvas.create_text(pad_l + pw * frac, h - 8, text=lbl, anchor="center",
+                           fill=TXT_DIM, font=(FONT, 7))
+
+    # series polylines (break on None = stream down)
+    for sid, color, _n in series:
+        pts = []
+        for s in samples_by_sid.get(sid, ()):
+            if s["t"] < t0:
+                continue
+            v = s.get(key)
+            if v is None:
+                if len(pts) >= 4:
+                    canvas.create_line(*pts, fill=color, width=2)
+                pts = []
+                continue
+            pts.extend((X(s["t"]), Y(v)))
+        if len(pts) >= 4:
+            canvas.create_line(*pts, fill=color, width=2)
+
+    # legend with current values
+    lx = legend_x0
+    for sid, color, label in series:
+        cur = None
+        for s in reversed(samples_by_sid.get(sid, ())):
+            if s.get(key) is not None:
+                cur = s.get(key)
+                break
+        canvas.create_rectangle(lx, 11, lx + 9, 19, fill=color, outline="")
+        txt = f"{label} {value_fmt(cur)}{unit}" if cur is not None else f"{label} -"
+        tid = canvas.create_text(lx + 13, 15, text=txt, anchor="w",
+                                 fill=TXT_DIM, font=(FONT, 8))
+        lx = canvas.bbox(tid)[2] + 12
+
+
+# ---------------------------------------------------------------------------
+# Tkinter GUI (HPE-themed, with live + history charts)
 # ---------------------------------------------------------------------------
 def run_gui(engine, args):
     import tkinter as tk
     from tkinter import ttk
 
+    view_seconds = float(args.history)
+    series = [(sid, STREAM_COLORS[sid], name.split("-")[1])
+              for sid, proto, port, name in STREAMS]
+
     root = tk.Tk()
-    root.title(f"netquality  -  peer {args.peer}")
-    root.geometry("980x430")
-    root.minsize(820, 360)
+    root.title(f"HPE Network Quality Monitor  -  peer {args.peer}")
+    root.geometry("1180x760")
+    root.minsize(960, 640)
+    root.configure(bg=BG)
 
-    # ---- header: overall score -------------------------------------------
-    header = tk.Frame(root, padx=12, pady=10)
-    header.pack(fill="x")
-
-    score_var = tk.StringVar(value="--")
-    label_var = tk.StringVar(value="Starting...")
-    sub_var = tk.StringVar(value="")
-
-    score_lbl = tk.Label(header, textvariable=score_var, font=("Segoe UI", 40, "bold"),
-                         width=4, fg="white", bg="#888888")
-    score_lbl.pack(side="left", padx=(0, 16))
-
-    txt = tk.Frame(header)
-    txt.pack(side="left", anchor="w")
-    tk.Label(txt, text="Connection quality", font=("Segoe UI", 11)).pack(anchor="w")
-    tk.Label(txt, textvariable=label_var, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-    tk.Label(txt, textvariable=sub_var, font=("Segoe UI", 9), fg="#555").pack(anchor="w")
-
-    # ---- table ------------------------------------------------------------
-    cols = ("stream", "status", "rtt", "latency", "jitter", "loss", "score",
-            "mos", "txpps", "rxpps")
-    headings = {
-        "stream": "Stream", "status": "Status", "rtt": "RTT ms",
-        "latency": "1-way ms", "jitter": "Jitter ms", "loss": "Loss %",
-        "score": "Score", "mos": "MOS", "txpps": "TX pps", "rxpps": "RX pps",
-    }
-    widths = {
-        "stream": 110, "status": 80, "rtt": 90, "latency": 80, "jitter": 80,
-        "loss": 80, "score": 70, "mos": 60, "txpps": 70, "rxpps": 70,
-    }
-
-    table_frame = tk.Frame(root, padx=12)
-    table_frame.pack(fill="both", expand=True)
-    tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=len(STREAMS))
-    for c in cols:
-        tree.heading(c, text=headings[c])
-        anchor = "w" if c == "stream" else "center"
-        tree.column(c, width=widths[c], anchor=anchor, stretch=(c == "stream"))
-    tree.pack(fill="both", expand=True)
-
+    # ---- ttk dark theme ---------------------------------------------------
     style = ttk.Style()
     try:
-        style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        style.theme_use("clam")
     except tk.TclError:
         pass
+    style.configure("NQ.Treeview", background=PANEL, fieldbackground=PANEL,
+                    foreground=TXT, rowheight=30, font=(FONT, 10), borderwidth=0)
+    style.configure("NQ.Treeview.Heading", background=PANEL_HI, foreground=HPE_GREEN,
+                    font=(FONT, 9, "bold"), relief="flat", borderwidth=0)
+    style.map("NQ.Treeview.Heading", background=[("active", PANEL_HI)])
+    style.map("NQ.Treeview", background=[("selected", HPE_GREEN_DK)],
+              foreground=[("selected", "white")])
 
+    # ---- header bar -------------------------------------------------------
+    header = tk.Frame(root, bg=BG, padx=14, pady=10)
+    header.pack(fill="x")
+
+    # HPE-style brand mark: green rectangle element + wordmark
+    mark = tk.Canvas(header, width=58, height=34, bg=BG, highlightthickness=0)
+    mark.pack(side="left", padx=(0, 12))
+    mark.create_rectangle(3, 9, 54, 26, outline=HPE_GREEN, width=4)
+
+    brand = tk.Frame(header, bg=BG)
+    brand.pack(side="left", anchor="w")
+    tk.Label(brand, text="HPE", fg=HPE_GREEN, bg=BG,
+             font=(FONT, 16, "bold")).pack(side="left")
+    tk.Label(brand, text="  Network Quality Monitor", fg=TXT, bg=BG,
+             font=(FONT, 16)).pack(side="left")
+
+    # overall score box on the right
+    scorebox = tk.Frame(header, bg=BG)
+    scorebox.pack(side="right")
+    label_var = tk.StringVar(value="Starting...")
+    sub_var = tk.StringVar(value="")
+    txt = tk.Frame(scorebox, bg=BG)
+    txt.pack(side="right", padx=(12, 0))
+    tk.Label(txt, text="CONNECTION QUALITY", fg=TXT_DIM, bg=BG,
+             font=(FONT, 8, "bold")).pack(anchor="e")
+    tk.Label(txt, textvariable=label_var, fg=TXT, bg=BG,
+             font=(FONT, 17, "bold")).pack(anchor="e")
+    tk.Label(txt, textvariable=sub_var, fg=TXT_DIM, bg=BG,
+             font=(FONT, 9)).pack(anchor="e")
+    score_var = tk.StringVar(value="--")
+    score_lbl = tk.Label(scorebox, textvariable=score_var, font=(FONT, 34, "bold"),
+                         width=4, fg="white", bg="#555a61")
+    score_lbl.pack(side="right")
+
+    # ---- charts -----------------------------------------------------------
+    charts = tk.Frame(root, bg=BG, padx=12, pady=4)
+    charts.pack(fill="both", expand=True)
+
+    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0, height=210)
+    lat_canvas.pack(fill="both", expand=True, pady=(0, 8))
+
+    bottom = tk.Frame(charts, bg=BG)
+    bottom.pack(fill="both", expand=True)
+    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
+    loss_canvas.pack(side="left", fill="both", expand=True, padx=(0, 4))
+    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
+    jit_canvas.pack(side="left", fill="both", expand=True, padx=(4, 0))
+
+    # ---- table ------------------------------------------------------------
+    cols = ("stream", "status", "rtt", "latency", "jitter", "loss", "late",
+            "score", "mos", "txpps", "rxpps")
+    headings = {
+        "stream": "Stream", "status": "Status", "rtt": "RTT ms", "latency": "1-way ms",
+        "jitter": "Jitter ms", "loss": "Loss %", "late": "Late %", "score": "Score",
+        "mos": "MOS", "txpps": "TX pps", "rxpps": "RX pps",
+    }
+    widths = {
+        "stream": 110, "status": 78, "rtt": 86, "latency": 78, "jitter": 80,
+        "loss": 70, "late": 70, "score": 64, "mos": 58, "txpps": 70, "rxpps": 70,
+    }
+    table_frame = tk.Frame(root, bg=BG, padx=12, pady=6)
+    table_frame.pack(fill="x")
+    tree = ttk.Treeview(table_frame, columns=cols, show="headings",
+                        height=len(STREAMS), style="NQ.Treeview")
+    for c in cols:
+        tree.heading(c, text=headings[c])
+        tree.column(c, width=widths[c], anchor=("w" if c == "stream" else "center"),
+                    stretch=(c == "stream"))
+    tree.pack(fill="x")
+    for band, col, fg in (("ok", "#1e3a30", TXT), ("warn", "#3a341c", TXT),
+                          ("bad", "#3d2622", "#ffb3a6"), ("down", "#2a2d33", TXT_DIM)):
+        tree.tag_configure(band, background=col, foreground=fg)
     for sid, proto, port, name in STREAMS:
-        tree.insert("", "end", iid=str(sid), values=(name, "...", "", "", "", "", "", "", "", ""))
-
-    # tag colours by score band
-    for band, col in (("ok", "#e7f4e8"), ("warn", "#fff6da"), ("bad", "#fde3dd"), ("down", "#eeeeee")):
-        tree.tag_configure(band, background=col)
+        tree.insert("", "end", iid=str(sid),
+                    values=(name, "...", "", "", "", "", "", "", "", "", ""))
 
     # ---- footer -----------------------------------------------------------
-    footer = tk.Frame(root, padx=12, pady=6)
+    footer = tk.Frame(root, bg=BG, padx=14, pady=6)
     footer.pack(fill="x")
     foot_var = tk.StringVar(value="")
-    tk.Label(footer, textvariable=foot_var, font=("Segoe UI", 9), fg="#555").pack(side="left")
+    tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
+             font=(FONT, 9)).pack(side="left")
 
     def fmt(v, nd=1):
         return f"{v:.{nd}f}"
@@ -581,40 +809,57 @@ def run_gui(engine, args):
         for row in snap["rows"]:
             if not row["connected"]:
                 status, band = "DOWN", "down"
-            elif row["score"] >= 70 and row["loss"] < 1.0:
+            elif row["score"] >= 70 and (row["loss"] + row["late"]) < 1.0:
                 status, band = "UP", "ok"
             elif row["score"] >= 50:
                 status, band = "UP", "warn"
             else:
                 status, band = "UP", "bad"
+            up = row["connected"]
             vals = (
                 row["name"], status,
-                fmt(row["rtt_avg"], 2) if row["connected"] else "-",
-                fmt(row["latency"], 2) if row["connected"] else "-",
-                fmt(row["jitter"], 2) if row["connected"] else "-",
+                fmt(row["rtt_avg"], 2) if up else "-",
+                fmt(row["latency"], 2) if up else "-",
+                fmt(row["jitter"], 2) if up else "-",
                 fmt(row["loss"], 1),
-                fmt(row["score"], 0) if row["connected"] else "-",
-                fmt(row["mos"], 2) if row["connected"] else "-",
+                fmt(row["late"], 1),
+                fmt(row["score"], 0) if up else "-",
+                fmt(row["mos"], 2) if up else "-",
                 fmt(row["tx_pps"], 0),
                 fmt(row["rx_pps"], 0),
             )
             tree.item(str(row["sid"]), values=vals, tags=(band,))
 
-        overall = snap["overall"]
         if snap["links_up"] == 0:
             score_var.set("--")
-            score_lbl.configure(bg="#888888")
+            score_lbl.configure(bg="#555a61")
             label_var.set("Waiting for peer")
-            sub_var.set(f"peer {args.peer}  -  no streams up yet")
+            sub_var.set(f"peer {args.peer} - no streams up yet")
         else:
-            score_var.set(f"{overall:.0f}")
-            score_lbl.configure(bg=score_color(overall))
+            o = snap["overall"]
+            score_var.set(f"{o:.0f}")
+            score_lbl.configure(bg=score_color(o))
             label_var.set(snap["overall_label"])
-            sub_var.set(f"worst stream {snap['worst']:.0f}  -  {snap['links_up']}/{len(STREAMS)} streams up")
-        up = int(snap["uptime"])
-        foot_var.set(f"peer {args.peer}   bind {args.bind}   "
-                     f"UDP 5201/5202  TCP 5101/5102   "
-                     f"{args.pps} probes/s/stream   uptime {up//3600:02d}:{(up%3600)//60:02d}:{up%60:02d}")
+            sub_var.set(f"worst {snap['worst']:.0f}  -  "
+                        f"{snap['links_up']}/{len(STREAMS)} streams up")
+
+        up_s = int(snap["uptime"])
+        foot_var.set(f"peer {args.peer}    bind {args.bind}    "
+                     f"UDP 5201/5202  TCP 5101/5102    {args.pps} probes/s/stream    "
+                     f"history {int(view_seconds)}s    "
+                     f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}")
+
+        hist = engine.history_copy()
+        now = time.time()
+        _draw_chart(lat_canvas, "Latency (RTT, ms)", "rtt", series, hist,
+                    view_seconds, now, ymin_floor=2.0, unit="",
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+        _draw_chart(loss_canvas, "Loss + late (%)", "loss", series, hist,
+                    view_seconds, now, ymin_floor=2.0, unit="%",
+                    value_fmt=lambda v: f"{v:.0f}")
+        _draw_chart(jit_canvas, "Jitter (ms)", "jitter", series, hist,
+                    view_seconds, now, ymin_floor=1.0, unit="",
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
         root.after(args.refresh_ms, refresh)
 
     def on_close():
@@ -622,7 +867,7 @@ def run_gui(engine, args):
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
-    root.after(args.refresh_ms, refresh)
+    root.after(120, refresh)  # let the window realize its size first
     root.mainloop()
 
 
@@ -640,21 +885,23 @@ def run_console(engine, args):
             o = snap["overall"]
             print(f"  OVERALL QUALITY: {o:5.1f}/100  {snap['overall_label']:<10}"
                   f"  ({snap['links_up']}/{len(STREAMS)} streams up, worst {snap['worst']:.0f})")
-            print("  " + "-" * 92)
+            print("  " + "-" * 100)
             print(f"  {'Stream':<10}{'Status':<8}{'RTT ms':>9}{'1-way':>9}"
-                  f"{'Jitter':>9}{'Loss %':>9}{'Score':>7}{'MOS':>6}{'TXpps':>8}{'RXpps':>8}")
-            print("  " + "-" * 92)
+                  f"{'Jitter':>9}{'Loss %':>9}{'Late %':>9}{'Score':>7}{'MOS':>6}"
+                  f"{'TXpps':>8}{'RXpps':>8}")
+            print("  " + "-" * 100)
             for r in snap["rows"]:
                 st = "UP" if r["connected"] else "DOWN"
                 if r["connected"]:
                     print(f"  {r['name']:<10}{st:<8}{r['rtt_avg']:>9.2f}{r['latency']:>9.2f}"
-                          f"{r['jitter']:>9.2f}{r['loss']:>9.1f}{r['score']:>7.0f}{r['mos']:>6.2f}"
-                          f"{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
+                          f"{r['jitter']:>9.2f}{r['loss']:>9.1f}{r['late']:>9.1f}{r['score']:>7.0f}"
+                          f"{r['mos']:>6.2f}{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
                 else:
                     print(f"  {r['name']:<10}{st:<8}{'-':>9}{'-':>9}{'-':>9}"
-                          f"{r['loss']:>9.1f}{'-':>7}{'-':>6}{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
+                          f"{r['loss']:>9.1f}{r['late']:>9.1f}{'-':>7}{'-':>6}"
+                          f"{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
             up = int(snap["uptime"])
-            print("  " + "-" * 92)
+            print("  " + "-" * 100)
             print(f"  uptime {up//3600:02d}:{(up%3600)//60:02d}:{up%60:02d}")
             time.sleep(args.refresh_ms / 1000.0)
     except KeyboardInterrupt:
@@ -680,6 +927,8 @@ def parse_args(argv=None):
                    help="Sliding window in seconds for loss/jitter/rates (default 10).")
     p.add_argument("--timeout", type=float, default=2.0,
                    help="Seconds before an un-echoed probe counts as lost (default 2).")
+    p.add_argument("--history", type=int, default=300,
+                   help="Seconds of history shown in the charts (default 300).")
     p.add_argument("--refresh-ms", type=int, default=500,
                    help="UI refresh interval in ms (default 500).")
     p.add_argument("--no-gui", action="store_true",
@@ -694,7 +943,8 @@ def main(argv=None):
     if args.pps < 1:
         args.pps = 1
 
-    engine = Engine(args.peer, args.bind, args.size, args.pps, args.window, args.timeout)
+    engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
+                    args.timeout, history_seconds=args.history)
     engine.start()
 
     use_gui = not args.no_gui
