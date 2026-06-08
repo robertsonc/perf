@@ -7,12 +7,19 @@ connection with a **quality score**.
 You run the *exact same program* on both machines. Each instance continuously
 **sends and receives** four probe streams at once:
 
-| Stream    | Protocol | Port |
-|-----------|----------|------|
-| UDP-5201  | UDP      | 5201 |
-| UDP-5202  | UDP      | 5202 |
-| TCP-5101  | TCP      | 5101 |
-| TCP-5102  | TCP      | 5102 |
+| Stream      | Protocol | Default port |
+|-------------|----------|--------------|
+| UDP-30201   | UDP      | 30201 |
+| UDP-30202   | UDP      | 30202 |
+| TCP-30101   | TCP      | 30101 |
+| TCP-30102   | TCP      | 30102 |
+
+The default ports live in the unassigned **30100/30200** block: below every OS
+ephemeral range (so the OS won't reuse them) and with no Wireshark dissector.
+(The earlier 5201/5202 defaults collided with **iPerf3's** default port, which
+made Wireshark misparse our packets as iPerf3 and report bogus "loss / out-of-
+order".) Override them with `--udp-ports A,B` / `--tcp-ports A,B` if your
+firewall needs specific ports.
 
 Traffic flows **bi-directionally on every stream, all the time**. The UI updates
 in realtime and shows the connection's overall experience at a glance.
@@ -135,7 +142,7 @@ local buffer overflow.
 
 If you still see a little UDP loss on a path you believe is clean, confirm
 whether it's on the wire with a two-ended packet capture (e.g. Wireshark): on
-each host capture `udp port 5201`, then compare how many probe datagrams one
+each host capture `udp port 30201`, then compare how many probe datagrams one
 host **sent** against how many the other host **received**. If sent > received,
 the loss is real and on the network; if the counts match, it isn't leaving/
 arriving as loss at all.
@@ -158,6 +165,8 @@ Bad below.
 ```
 --peer IP          (required) the other workstation's IP
 --bind ADDR        local address to bind/listen on (default 0.0.0.0)
+--udp-ports A,B    the two UDP ports (default 30201,30202)
+--tcp-ports A,B    the two TCP ports (default 30101,30102)
 --pps N            probes per second per stream (default 50)
 --size N           probe packet size in bytes (default 200)
 --window SECONDS   sliding window for loss/jitter/rate (default 10)
@@ -175,7 +184,8 @@ resolve loss and jitter well. Bump `--pps` / `--size` for a heavier load test.
 
 The first time you run it, Windows may prompt to allow Python through the
 firewall — allow it on the relevant networks. If it was dismissed, add inbound
-rules for **UDP 5201–5202** and **TCP 5101–5102**, or allow `python.exe`.
+rules for **UDP 30201–30202** and **TCP 30101–30102** (or whatever you set with
+`--udp-ports`/`--tcp-ports`), or allow `python.exe`.
 
 ## Building a standalone .exe (optional)
 

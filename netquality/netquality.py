@@ -6,8 +6,8 @@ two workstations.
 A single, self-contained, dependency-free Python app. Run the SAME program on
 both workstations. Each instance continuously sends AND receives:
 
-    * 2 UDP probe streams  on ports 5201 and 5202
-    * 2 TCP probe streams  on ports 5101 and 5102
+    * 2 UDP probe streams  (default ports 30201 and 30202)
+    * 2 TCP probe streams  (default ports 30101 and 30102)
 
 Every stream is a probe -> echo loop, so round-trip time (and therefore latency,
 loss and jitter) is measured without needing the two clocks to be synchronized.
@@ -58,14 +58,39 @@ HEADER_LEN = HEADER.size  # 18 bytes
 TYPE_PROBE = 1
 TYPE_ECHO = 2
 
-# Stream catalogue. Order is the display order in the UI.
+# Stream catalogue. Order is the display order in the UI; sids stay 0..3 so the
+# colour map and chart series are stable regardless of which ports are chosen.
 #   (sid, proto, port, label)
-STREAMS = [
-    (0, "UDP", 5201, "UDP-5201"),
-    (1, "UDP", 5202, "UDP-5202"),
-    (2, "TCP", 5101, "TCP-5101"),
-    (3, "TCP", 5102, "TCP-5102"),
-]
+#
+# Default ports live in the unassigned 30100/30200 block: below every OS
+# ephemeral range (Windows 49152+, Linux 32768+) so the OS won't hand them to an
+# outbound socket, and with no Wireshark dissector (unlike 5201, iPerf3's default
+# port, which made Wireshark misparse our packets as iPerf3 traffic).
+DEFAULT_UDP_PORTS = (30201, 30202)
+DEFAULT_TCP_PORTS = (30101, 30102)
+
+
+def build_streams(udp_ports, tcp_ports):
+    """Build the stream catalogue from the chosen UDP/TCP port pairs."""
+    streams = []
+    sid = 0
+    for port in udp_ports:
+        streams.append((sid, "UDP", port, f"UDP-{port}"))
+        sid += 1
+    for port in tcp_ports:
+        streams.append((sid, "TCP", port, f"TCP-{port}"))
+        sid += 1
+    return streams
+
+
+STREAMS = build_streams(DEFAULT_UDP_PORTS, DEFAULT_TCP_PORTS)
+
+
+def ports_summary():
+    """e.g. 'UDP 30201/30202  TCP 30101/30102' from the current STREAMS."""
+    udp = "/".join(str(p) for _, proto, p, _ in STREAMS if proto == "UDP")
+    tcp = "/".join(str(p) for _, proto, p, _ in STREAMS if proto == "TCP")
+    return f"UDP {udp}  TCP {tcp}"
 
 
 def build_packet(ptype, sid, seq, ts_ns, size):
@@ -875,7 +900,7 @@ def run_gui(engine, args):
 
         up_s = int(snap["uptime"])
         foot_var.set(f"peer {args.peer}    bind {args.bind}    "
-                     f"UDP 5201/5202  TCP 5101/5102    {args.pps} probes/s/stream    "
+                     f"{ports_summary()}    {args.pps} probes/s/stream    "
                      f"history {int(view_seconds)}s    "
                      f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}")
 
@@ -906,7 +931,7 @@ def run_gui(engine, args):
 # ---------------------------------------------------------------------------
 def run_console(engine, args):
     print(f"Network Vitals  peer={args.peer}  bind={args.bind}  "
-          f"UDP 5201/5202  TCP 5101/5102  {args.pps} probes/s/stream")
+          f"{ports_summary()}  {args.pps} probes/s/stream")
     print("Ctrl-C to stop.\n")
     try:
         while not engine.stop.is_set():
@@ -943,12 +968,33 @@ def run_console(engine, args):
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def _port_pair(text):
+    """Parse 'A,B' into a (A, B) tuple of two valid ports."""
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected exactly two ports, e.g. 30201,30202")
+    try:
+        ports = tuple(int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError("ports must be integers")
+    for p in ports:
+        if not (1 <= p <= 65535):
+            raise argparse.ArgumentTypeError(f"port {p} out of range 1-65535")
+    return ports
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Bidirectional UDP/TCP network quality probe between two workstations.")
     p.add_argument("--peer", required=True, help="IP address of the other workstation.")
     p.add_argument("--bind", default="0.0.0.0",
                    help="Local address to bind/listen on (default: all interfaces).")
+    p.add_argument("--udp-ports", type=_port_pair, default=DEFAULT_UDP_PORTS,
+                   metavar="A,B",
+                   help="The two UDP ports (default %d,%d)." % DEFAULT_UDP_PORTS)
+    p.add_argument("--tcp-ports", type=_port_pair, default=DEFAULT_TCP_PORTS,
+                   metavar="A,B",
+                   help="The two TCP ports (default %d,%d)." % DEFAULT_TCP_PORTS)
     p.add_argument("--pps", type=int, default=50,
                    help="Probe packets per second, per stream (default 50).")
     p.add_argument("--size", type=int, default=200,
@@ -998,6 +1044,10 @@ def main(argv=None):
         args.size = HEADER_LEN
     if args.pps < 1:
         args.pps = 1
+
+    # Apply chosen ports (read as a module global by the engine and UI).
+    global STREAMS
+    STREAMS = build_streams(args.udp_ports, args.tcp_ports)
 
     set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
     engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
