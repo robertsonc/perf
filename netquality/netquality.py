@@ -6,8 +6,8 @@ two workstations.
 A single, self-contained, dependency-free Python app. Run the SAME program on
 both workstations. Each instance continuously sends AND receives:
 
-    * 2 UDP probe streams  on ports 5201 and 5202
-    * 2 TCP probe streams  on ports 5101 and 5102
+    * 2 UDP probe streams  (default ports 30201 and 30202)
+    * 2 TCP probe streams  (default ports 30101 and 30102)
 
 Every stream is a probe -> echo loop, so round-trip time (and therefore latency,
 loss and jitter) is measured without needing the two clocks to be synchronized.
@@ -58,14 +58,39 @@ HEADER_LEN = HEADER.size  # 18 bytes
 TYPE_PROBE = 1
 TYPE_ECHO = 2
 
-# Stream catalogue. Order is the display order in the UI.
+# Stream catalogue. Order is the display order in the UI; sids stay 0..3 so the
+# colour map and chart series are stable regardless of which ports are chosen.
 #   (sid, proto, port, label)
-STREAMS = [
-    (0, "UDP", 5201, "UDP-5201"),
-    (1, "UDP", 5202, "UDP-5202"),
-    (2, "TCP", 5101, "TCP-5101"),
-    (3, "TCP", 5102, "TCP-5102"),
-]
+#
+# Default ports live in the unassigned 30100/30200 block: below every OS
+# ephemeral range (Windows 49152+, Linux 32768+) so the OS won't hand them to an
+# outbound socket, and with no Wireshark dissector (unlike 5201, iPerf3's default
+# port, which made Wireshark misparse our packets as iPerf3 traffic).
+DEFAULT_UDP_PORTS = (30201, 30202)
+DEFAULT_TCP_PORTS = (30101, 30102)
+
+
+def build_streams(udp_ports, tcp_ports):
+    """Build the stream catalogue from the chosen UDP/TCP port pairs."""
+    streams = []
+    sid = 0
+    for port in udp_ports:
+        streams.append((sid, "UDP", port, f"UDP-{port}"))
+        sid += 1
+    for port in tcp_ports:
+        streams.append((sid, "TCP", port, f"TCP-{port}"))
+        sid += 1
+    return streams
+
+
+STREAMS = build_streams(DEFAULT_UDP_PORTS, DEFAULT_TCP_PORTS)
+
+
+def ports_summary():
+    """e.g. 'UDP 30201/30202  TCP 30101/30102' from the current STREAMS."""
+    udp = "/".join(str(p) for _, proto, p, _ in STREAMS if proto == "UDP")
+    tcp = "/".join(str(p) for _, proto, p, _ in STREAMS if proto == "TCP")
+    return f"UDP {udp}  TCP {tcp}"
 
 
 def build_packet(ptype, sid, seq, ts_ns, size):
@@ -526,12 +551,14 @@ class TCPStream:
 # Engine: owns all streams + their stats
 # ---------------------------------------------------------------------------
 class Engine:
-    def __init__(self, peer, bind, size, pps, window, timeout, history_seconds=300):
+    def __init__(self, peer, bind, size, pps, window, timeout, history_seconds=300,
+                 loss_deadband=0.5):
         self.peer = peer
         self.bind = bind
         self.stop = threading.Event()
         self.start_time = time.time()
         self.history_seconds = history_seconds
+        self.loss_deadband = loss_deadband  # combined loss+late below this reads as 0
         interval = 1.0 / pps
         self.stats = {}
         self.streams = []
@@ -555,6 +582,11 @@ class Engine:
     def shutdown(self):
         self.stop.set()
 
+    def effective_loss(self, loss, late):
+        """Combined loss+late, with a deadband so trivial blips read as zero."""
+        eff = min(100.0, loss + late)
+        return 0.0 if eff < self.loss_deadband else eff
+
     def _sampler(self):
         """Append one history sample per stream every second."""
         while not self.stop.wait(1.0):
@@ -562,13 +594,13 @@ class Engine:
             with self.history_lock:
                 for sid in self.history:
                     snap = self.stats[sid].snapshot()
-                    eff = min(100.0, snap["loss"] + snap["late"])
+                    eff = self.effective_loss(snap["loss"], snap["late"])
                     r, _, _ = quality_score(snap["latency"], eff, snap["jitter"])
                     up = snap["connected"]
                     self.history[sid].append({
                         "t": now,
                         "rtt": snap["rtt_avg"] if up else None,
-                        "loss": min(100.0, snap["loss"] + snap["late"]),
+                        "loss": eff,
                         "jitter": snap["jitter"] if up else None,
                         "score": r if up else None,
                         "up": up,
@@ -583,13 +615,18 @@ class Engine:
         rows = []
         scores = []
         moses = []
+        tot_tx = tot_recv = tot_lost = tot_late = 0
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
-            eff = min(100.0, snap["loss"] + snap["late"])  # late is as bad as lost for real-time
+            eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
             r, mos, label = quality_score(snap["latency"], eff, snap["jitter"])
             snap.update(sid=sid, proto=proto, port=port, name=name,
-                        score=r, mos=mos, label=label)
+                        score=r, mos=mos, label=label, eff_loss=eff)
             rows.append(snap)
+            tot_tx += snap["cum_tx"]
+            tot_recv += snap["cum_recv"]
+            tot_lost += snap["cum_lost"]
+            tot_late += snap["cum_late"]
             if snap["connected"] and snap["samples"] > 0:
                 scores.append(r)
                 moses.append(mos)
@@ -601,6 +638,12 @@ class Engine:
             overall = 0.0
             worst = 0.0
             overall_mos = 0.0
+        decided = tot_recv + tot_lost + tot_late
+        totals = {
+            "tx": tot_tx, "recv": tot_recv, "lost": tot_lost, "late": tot_late,
+            "loss_pct": (tot_lost / decided * 100.0) if decided else 0.0,
+            "late_pct": (tot_late / decided * 100.0) if decided else 0.0,
+        }
         return {
             "rows": rows,
             "overall": overall,
@@ -609,6 +652,7 @@ class Engine:
             "overall_label": score_label(overall) if scores else "No link",
             "uptime": time.time() - self.start_time,
             "links_up": len(scores),
+            "totals": totals,
         }
 
     def reset(self):
@@ -804,7 +848,25 @@ def run_gui(engine, args):
                           activeforeground="white", relief="flat", bd=0,
                           highlightthickness=0, padx=12, pady=5,
                           font=(FONT, 9, "bold"), cursor="hand2")
-    reset_btn.pack(side="left", padx=18)
+    reset_btn.pack(side="left", padx=(18, 6))
+
+    totals_shown = {"on": False}
+
+    def do_toggle_totals():
+        totals_shown["on"] = not totals_shown["on"]
+        if totals_shown["on"]:
+            totals_tree.pack(fill="x")
+            totals_btn.configure(text="▴  Totals")
+        else:
+            totals_tree.pack_forget()
+            totals_btn.configure(text="▾  Totals")
+
+    totals_btn = tk.Button(header, text="▾  Totals", command=do_toggle_totals,
+                           bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                           activeforeground="white", relief="flat", bd=0,
+                           highlightthickness=0, padx=12, pady=5,
+                           font=(FONT, 9, "bold"), cursor="hand2")
+    totals_btn.pack(side="left")
 
     # right-hand stat cluster: quality text + experience score + composite MOS
     stats = tk.Frame(header, bg=BG)
@@ -842,6 +904,22 @@ def run_gui(engine, args):
     tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
              font=(FONT, 9)).pack(side="left")
 
+    # ---- totals table (hidden by default; toggled by the Totals button) ----
+    totals_cols = ("stream", "sent", "recv", "lost", "late", "lossp")
+    totals_head = {"stream": "Stream", "sent": "Sent", "recv": "Received",
+                   "lost": "Lost", "late": "Late", "lossp": "Loss %"}
+    totals_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
+    totals_frame.pack(fill="x", side="bottom")
+    totals_tree = ttk.Treeview(totals_frame, columns=totals_cols, show="headings",
+                               height=len(STREAMS), style="NQ.Treeview")
+    for c in totals_cols:
+        totals_tree.heading(c, text=totals_head[c])
+        totals_tree.column(c, width=120, anchor=("w" if c == "stream" else "e"),
+                           stretch=(c == "stream"))
+    for sid, proto, port, name in STREAMS:
+        totals_tree.insert("", "end", iid=f"t{sid}", values=(name, 0, 0, 0, 0, "0.0"))
+    # not packed yet -> hidden until the Totals button is clicked
+
     # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
     charts = tk.Frame(root, bg=BG, padx=12, pady=6)
     charts.pack(fill="both", expand=True)
@@ -874,10 +952,20 @@ def run_gui(engine, args):
                         f"{snap['links_up']}/{len(STREAMS)} streams up")
 
         up_s = int(snap["uptime"])
-        foot_var.set(f"peer {args.peer}    bind {args.bind}    "
-                     f"UDP 5201/5202  TCP 5101/5102    {args.pps} probes/s/stream    "
-                     f"history {int(view_seconds)}s    "
-                     f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}")
+        t = snap["totals"]
+        foot_var.set(
+            f"peer {args.peer}    {ports_summary()}    {args.pps} probes/s/stream    "
+            f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}"
+            f"    |  since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
+            f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  late {t['late']:,}")
+
+        if totals_shown["on"]:
+            for row in snap["rows"]:
+                decided = row["cum_recv"] + row["cum_lost"] + row["cum_late"]
+                lossp = (row["cum_lost"] / decided * 100.0) if decided else 0.0
+                totals_tree.item(f"t{row['sid']}", values=(
+                    row["name"], f"{row['cum_tx']:,}", f"{row['cum_recv']:,}",
+                    f"{row['cum_lost']:,}", f"{row['cum_late']:,}", f"{lossp:.2f}"))
 
         hist = engine.history_copy()
         now = time.time()
@@ -906,7 +994,7 @@ def run_gui(engine, args):
 # ---------------------------------------------------------------------------
 def run_console(engine, args):
     print(f"Network Vitals  peer={args.peer}  bind={args.bind}  "
-          f"UDP 5201/5202  TCP 5101/5102  {args.pps} probes/s/stream")
+          f"{ports_summary()}  {args.pps} probes/s/stream")
     print("Ctrl-C to stop.\n")
     try:
         while not engine.stop.is_set():
@@ -931,7 +1019,11 @@ def run_console(engine, args):
                           f"{r['loss']:>9.1f}{r['late']:>9.1f}{'-':>7}{'-':>6}"
                           f"{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
             up = int(snap["uptime"])
+            t = snap["totals"]
             print("  " + "-" * 100)
+            print(f"  totals since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
+                  f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  late {t['late']:,} "
+                  f"({t['late_pct']:.2f}%)")
             print(f"  uptime {up//3600:02d}:{(up%3600)//60:02d}:{up%60:02d}")
             time.sleep(args.refresh_ms / 1000.0)
     except KeyboardInterrupt:
@@ -943,12 +1035,33 @@ def run_console(engine, args):
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def _port_pair(text):
+    """Parse 'A,B' into a (A, B) tuple of two valid ports."""
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected exactly two ports, e.g. 30201,30202")
+    try:
+        ports = tuple(int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError("ports must be integers")
+    for p in ports:
+        if not (1 <= p <= 65535):
+            raise argparse.ArgumentTypeError(f"port {p} out of range 1-65535")
+    return ports
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Bidirectional UDP/TCP network quality probe between two workstations.")
     p.add_argument("--peer", required=True, help="IP address of the other workstation.")
     p.add_argument("--bind", default="0.0.0.0",
                    help="Local address to bind/listen on (default: all interfaces).")
+    p.add_argument("--udp-ports", type=_port_pair, default=DEFAULT_UDP_PORTS,
+                   metavar="A,B",
+                   help="The two UDP ports (default %d,%d)." % DEFAULT_UDP_PORTS)
+    p.add_argument("--tcp-ports", type=_port_pair, default=DEFAULT_TCP_PORTS,
+                   metavar="A,B",
+                   help="The two TCP ports (default %d,%d)." % DEFAULT_TCP_PORTS)
     p.add_argument("--pps", type=int, default=50,
                    help="Probe packets per second, per stream (default 50).")
     p.add_argument("--size", type=int, default=200,
@@ -957,6 +1070,8 @@ def parse_args(argv=None):
                    help="Sliding window in seconds for loss/jitter/rates (default 10).")
     p.add_argument("--timeout", type=float, default=2.0,
                    help="Seconds before an un-echoed probe counts as lost (default 2).")
+    p.add_argument("--loss-deadband", type=float, default=0.5,
+                   help="Combined loss+late below this %% reads as 0 (default 0.5; 0 disables).")
     p.add_argument("--history", type=int, default=300,
                    help="Seconds of history shown in the charts (default 300).")
     p.add_argument("--refresh-ms", type=int, default=500,
@@ -999,9 +1114,14 @@ def main(argv=None):
     if args.pps < 1:
         args.pps = 1
 
+    # Apply chosen ports (read as a module global by the engine and UI).
+    global STREAMS
+    STREAMS = build_streams(args.udp_ports, args.tcp_ports)
+
     set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
     engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
-                    args.timeout, history_seconds=args.history)
+                    args.timeout, history_seconds=args.history,
+                    loss_deadband=args.loss_deadband)
     engine.start()
 
     use_gui = not args.no_gui
