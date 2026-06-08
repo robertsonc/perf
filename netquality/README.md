@@ -126,9 +126,19 @@ never show it. The cause is **microbursts**, not the wire:
   rather than drops), which *de-bursts* the arrivals — so the buffer never
   overruns and loss falls to zero.
 
-To keep this local artifact out of the measurement, netquality enlarges the UDP
-socket send/receive buffers to a few MB (`SOCK_BUF_BYTES`), which absorbs the
-microbursts so reported loss reflects the path, not a local buffer overflow.
+To keep this local artifact out of the measurement, netquality (a) enlarges the
+UDP socket send/receive buffers to a few MB (`SOCK_BUF_BYTES`) so microbursts are
+absorbed, and (b) on Windows requests a 1 ms scheduler tick
+(`timeBeginPeriod(1)`) so the probe pacing is smooth instead of clumping into
+~15 ms bursts in the first place. Reported loss then reflects the path, not a
+local buffer overflow.
+
+If you still see a little UDP loss on a path you believe is clean, confirm
+whether it's on the wire with a two-ended packet capture (e.g. Wireshark): on
+each host capture `udp port 5201`, then compare how many probe datagrams one
+host **sent** against how many the other host **received**. If sent > received,
+the loss is real and on the network; if the counts match, it isn't leaving/
+arriving as loss at all.
 
 Because both instances originate probes *and* reflect the peer's probes on the
 same ports, every stream carries traffic in both directions continuously. For
