@@ -637,6 +637,25 @@ STREAM_COLORS = {0: "#01A982", 1: "#FF8300", 2: "#00B0E6", 3: "#FEC901"}
 
 
 
+def _draw_ekg(canvas, color=HPE_GREEN, width=2):
+    """Draw a small ECG/EKG heartbeat trace (P-QRS-T) onto a Tk Canvas.
+
+    Coordinates are tuned for a ~52x34 canvas: flat baseline, small P bump, a
+    sharp QRS spike, then a T bump back to baseline.
+    """
+    pts = [
+        (2, 18), (12, 18),          # baseline
+        (15, 14), (18, 18),         # P wave
+        (21, 18), (23, 21),         # flat into Q dip
+        (26, 4), (29, 30),          # R spike up, S dip down
+        (32, 18), (36, 11),         # back to baseline, T wave
+        (40, 18), (51, 18),         # baseline out
+    ]
+    flat = [c for xy in pts for c in xy]
+    canvas.create_line(*flat, fill=color, width=width,
+                       capstyle="round", joinstyle="round", smooth=False)
+
+
 def _nice_ceiling(v):
     """Round a value up to a clean 1/2/2.5/5 * 10^n axis maximum."""
     if v <= 0:
@@ -767,6 +786,11 @@ def run_gui(engine, args):
     # ---- header bar -------------------------------------------------------
     header = tk.Frame(root, bg=BG, padx=14, pady=10)
     header.pack(fill="x", side="top")
+
+    # EKG/heartbeat glyph (vector, drawn on a canvas)
+    ekg = tk.Canvas(header, width=54, height=34, bg=BG, highlightthickness=0)
+    ekg.pack(side="left", padx=(0, 10))
+    _draw_ekg(ekg)
 
     tk.Label(header, text="Network Quality Monitor", fg=TXT, bg=BG,
              font=(FONT, 17, "bold")).pack(side="left", anchor="w")
