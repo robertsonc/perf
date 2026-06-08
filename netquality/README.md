@@ -35,13 +35,17 @@ plus, in the header:
 - a big colour-coded **Experience score** (0–100, green = excellent → red = bad),
 - a composite **MOS (avg)** — the average MOS across the active streams,
 - a **Reset / Clear** button that wipes the charts and all accumulated
-  loss/latency/jitter stats so a demo can start from a clean slate.
+  loss/latency/jitter stats so a demo can start from a clean slate,
+- a **Totals** button that toggles a per-stream lifetime table (sent / received
+  / lost / late / loss %). Aggregate lifetime totals are always shown in the
+  bottom status bar; both reset with **Reset / Clear**.
 
 Charts keep a rolling history (default 5 minutes, `--history`). The window
 resizes freely; the charts grow and shrink with it.
 
-> Loss is still measured per stream and folded into the score (as `loss + late`,
-> see below) — it's just not shown as its own chart/table anymore.
+To stop trivial blips from denting a demo, a **loss deadband** (`--loss-deadband`,
+default 0.5%) treats a combined loss+late below the threshold as 0 for the score
+and the loss chart. (The lifetime totals always show the true raw counts.)
 
 ## Requirements
 
@@ -171,6 +175,7 @@ Bad below.
 --size N           probe packet size in bytes (default 200)
 --window SECONDS   sliding window for loss/jitter/rate (default 10)
 --timeout SECONDS  un-echoed probe -> lost after this (default 2)
+--loss-deadband P  combined loss+late below P%% reads as 0 (default 0.5; 0 off)
 --history SECONDS  span of the live/history charts (default 300)
 --refresh-ms N     UI refresh interval (default 500)
 --no-gui           force console UI
