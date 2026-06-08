@@ -110,6 +110,25 @@ way), but the two are reported separately so you can see which is happening.
 Raise `--timeout` if you want to tolerate slower paths before counting late/lost;
 lower it to be stricter about latency deadlines.
 
+#### Why a *clean* link can show a little UDP loss (and impairment makes it vanish)
+
+A counterintuitive thing you may see: a low-jitter path shows a small amount of
+**UDP** loss, while adding jitter/delay impairment drives it to ~0. TCP streams
+never show it. The cause is **microbursts**, not the wire:
+
+- The OS thread scheduler / timer granularity (≈15 ms on Windows) makes the
+  paced probes actually leave in small bursts rather than evenly spaced.
+- On a clean, low-jitter path those bursts arrive **still bunched**, and a burst
+  can momentarily overrun the socket receive buffer — a dropped datagram that
+  looks like loss. (TCP can't show this; the kernel retransmits invisibly.)
+- A jitter/delay impairment box **spreads packets out in time** (and buffers
+  rather than drops), which *de-bursts* the arrivals — so the buffer never
+  overruns and loss falls to zero.
+
+To keep this local artifact out of the measurement, netquality enlarges the UDP
+socket send/receive buffers to a few MB (`SOCK_BUF_BYTES`), which absorbs the
+microbursts so reported loss reflects the path, not a local buffer overflow.
+
 Because both instances originate probes *and* reflect the peer's probes on the
 same ports, every stream carries traffic in both directions continuously. For
 TCP, each instance runs both a listener (to reflect the peer) and a client

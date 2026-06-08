@@ -85,6 +85,24 @@ def parse_header(data):
     return ptype, sid, seq, ts_ns
 
 
+# Socket buffer size. Windows defaults to a small (~64 KB) UDP receive buffer.
+# Thread-scheduler/timer granularity (~15 ms on Windows) makes probes go out in
+# bursts; on a clean, low-jitter path those bursts arrive still bunched and can
+# momentarily overrun a small receive buffer, dropping UDP datagrams that then
+# look like packet loss. Enlarging the buffer absorbs the microbursts so the
+# loss we report reflects the wire, not a local buffer overflow.
+SOCK_BUF_BYTES = 4 * 1024 * 1024
+
+
+def enlarge_socket_buffers(sock):
+    """Best-effort enlarge of the send/receive buffers (ignored if capped)."""
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, SOCK_BUF_BYTES)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Per-stream statistics (thread-safe, sliding window)
 # ---------------------------------------------------------------------------
@@ -308,6 +326,7 @@ class UDPStream:
     def start(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        enlarge_socket_buffers(s)  # absorb Windows microbursts -> no phantom UDP loss
         s.bind((self.bind, self.port))
         s.settimeout(0.5)
         self.sock = s
