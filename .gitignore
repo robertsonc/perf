@@ -1,1 +1,7 @@
 config.yaml
+
+__pycache__/
+*.pyc
+netquality/dist/
+netquality/build/
+*.spec

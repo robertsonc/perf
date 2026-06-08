@@ -18,6 +18,16 @@ Traffic flows **bi-directionally on every stream, all the time**. The UI updates
 in realtime with per-stream loss / RTT / one-way latency / jitter, plus an
 overall connection quality score and MOS estimate.
 
+The HPE-themed dashboard shows **live + history charts** (latency, loss, jitter)
+alongside a per-stream table:
+
+- **Latency (RTT, ms)** — one line per stream
+- **Loss + late (%)** — effective impairment per stream
+- **Jitter (ms)** — per stream
+- a big colour-coded **overall quality score** (green = excellent → red = bad)
+
+Charts keep a rolling history (default 5 minutes, `--history`).
+
 ## Requirements
 
 - **Python 3.8+** (tested on 3.11). Nothing to `pip install` — it uses only the
@@ -67,9 +77,31 @@ back as an **echo** with the timestamp untouched. The originator then computes:
 
 - **RTT** = `now − echoed_timestamp` (measured entirely on its own clock, so no
   time sync needed). **One-way latency** is reported as RTT/2.
-- **Loss** — a probe with no echo within `--timeout` (default 2s) is counted as
-  lost; loss % is computed over a sliding `--window` (default 10s).
 - **Jitter** — RFC 3550 style smoothed mean deviation of successive RTTs.
+
+### Loss vs. late — how a frame is judged "lost"
+
+Every probe ends in exactly one of three outcomes, tallied over the sliding
+`--window` (default 10s):
+
+| Outcome | Meaning |
+|---|---|
+| **received** | echo came back within `--timeout` (default 2s) |
+| **lost** | no echo within `--timeout`, and none since — a real drop |
+| **late** | echo arrived **after** the `--timeout` deadline (reordered or over-buffered) |
+
+So a frame is declared *lost* when its echo hasn't returned within `--timeout`.
+**But what if it arrives after that?** It is *not* silently dropped: when the
+late echo eventually appears, the probe is reclassified `lost → late`, so
+**Loss %** reflects frames that *truly never came back* and **Late %** reflects
+frames that *came back too late to be useful*. This separates a dead path from a
+recoverable jitter/reorder event — they look identical if you only track "loss".
+
+For the **quality score**, `loss + late` is treated as the effective impairment
+(a real-time stream can't use a frame that misses its playout deadline either
+way), but the two are reported separately so you can see which is happening.
+Raise `--timeout` if you want to tolerate slower paths before counting late/lost;
+lower it to be stricter about latency deadlines.
 
 Because both instances originate probes *and* reflect the peer's probes on the
 same ports, every stream carries traffic in both directions continuously. For
@@ -93,6 +125,7 @@ Bad below.
 --size N           probe packet size in bytes (default 200)
 --window SECONDS   sliding window for loss/jitter/rate (default 10)
 --timeout SECONDS  un-echoed probe -> lost after this (default 2)
+--history SECONDS  span of the live/history charts (default 300)
 --refresh-ms N     UI refresh interval (default 500)
 --no-gui           force console UI
 ```
