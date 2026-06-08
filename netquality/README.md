@@ -15,18 +15,25 @@ You run the *exact same program* on both machines. Each instance continuously
 | TCP-5102  | TCP      | 5102 |
 
 Traffic flows **bi-directionally on every stream, all the time**. The UI updates
-in realtime with per-stream loss / RTT / one-way latency / jitter, plus an
-overall connection quality score and MOS estimate.
+in realtime and shows the connection's overall experience at a glance.
 
-The HPE-themed dashboard shows **live + history charts** (latency, loss, jitter)
-alongside a per-stream table:
+The dashboard shows **two live + history charts** with one line per stream:
 
-- **Latency (RTT, ms)** — one line per stream
-- **Loss + late (%)** — effective impairment per stream
-- **Jitter (ms)** — per stream
-- a big colour-coded **overall quality score** (green = excellent → red = bad)
+- **Latency (RTT, ms)**
+- **Jitter (ms)**
 
-Charts keep a rolling history (default 5 minutes, `--history`).
+plus, in the header:
+
+- a big colour-coded **Experience score** (0–100, green = excellent → red = bad),
+- a composite **MOS (avg)** — the average MOS across the active streams,
+- a **Reset / Clear** button that wipes the charts and all accumulated
+  loss/latency/jitter stats so a demo can start from a clean slate.
+
+Charts keep a rolling history (default 5 minutes, `--history`). The window
+resizes freely; the charts grow and shrink with it.
+
+> Loss is still measured per stream and folded into the score (as `loss + late`,
+> see below) — it's just not shown as its own chart/table anymore.
 
 ## Requirements
 

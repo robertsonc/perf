@@ -215,6 +215,19 @@ class StreamStats:
                 "cum_late": self.cum_late,
             }
 
+    def reset(self):
+        """Drop all accumulated samples/counters (used by the UI Reset button)."""
+        with self.lock:
+            self.rtt_samples.clear()
+            self.tx_events.clear()
+            self.resolved_order.clear()
+            self.state.clear()
+            self.pending.clear()
+            self.jitter = 0.0
+            self.last_rtt = None
+            self.last_echo_t = 0.0
+            self.cum_tx = self.cum_recv = self.cum_lost = self.cum_late = 0
+
     def _trim_locked(self):
         horizon = time.time() - self.window
         while self.rtt_samples and self.rtt_samples[0][0] < horizon:
@@ -549,6 +562,7 @@ class Engine:
         """Return per-stream snapshots + overall aggregate quality."""
         rows = []
         scores = []
+        moses = []
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
             eff = min(100.0, snap["loss"] + snap["late"])  # late is as bad as lost for real-time
@@ -558,20 +572,32 @@ class Engine:
             rows.append(snap)
             if snap["connected"] and snap["samples"] > 0:
                 scores.append(r)
+                moses.append(mos)
         if scores:
             overall = sum(scores) / len(scores)
             worst = min(scores)
+            overall_mos = sum(moses) / len(moses)   # composite MOS, instant average
         else:
             overall = 0.0
             worst = 0.0
+            overall_mos = 0.0
         return {
             "rows": rows,
             "overall": overall,
+            "overall_mos": overall_mos,
             "worst": worst,
             "overall_label": score_label(overall) if scores else "No link",
             "uptime": time.time() - self.start_time,
             "links_up": len(scores),
         }
+
+    def reset(self):
+        """Clear all measurement state and chart history (for a clean demo)."""
+        for st in self.stats.values():
+            st.reset()
+        with self.history_lock:
+            for dq in self.history.values():
+                dq.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -589,27 +615,6 @@ FONT = "Segoe UI"
 
 # distinct, on-brand line colours per stream
 STREAM_COLORS = {0: "#01A982", 1: "#FF8300", 2: "#00B0E6", 3: "#FEC901"}
-
-# FlowAtlas 'HPE Discover - Las Vegas 2026' brand logo (333x40 PNG, base64),
-# rasterized from the FlowAtlas UI's upper-left brand-logo SVG. Loaded via
-# Tk's native PNG support so the app stays single-file and dependency-free.
-LOGO_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAIsAAAAoCAYAAADOkQm/AAAABmJLR0QA/wD/AP+gvaeTAAAEAElEQVR4nO3bP2wbVQAG8O87J7Zb"
-    "O66d0hQqJQghdSkjggIS6gAqVIiFv1IHspAyMjEUsWRhoFIZoUhFaiVUBSRExVQ6Ak1A/BEtggGhLoBIiH1uLv4Tx/cxNGJA3J3r"
-    "e3dX4/eTMvn5vc/Op3tn35mu1/kMQYhGtVR8PvBxQ1yv8ziA14JzaKla2vVe1DwNrz1P8LjJbP8moOOA64DWBa6Susb+1kqlUvkr"
-    "7tzuRvcZUK+YyGmceGYCwGPBA/BnKjmgAwRDcvDbASe6Fwx5PQYQgKB/FpQAOfl+Y7OzTOB8r1X4YN8+bgwzt6g5hv0/skRdcrLO"
-    "8D+Ro/AIhHcmd3V/bXidVyXlsg5lmi2LeXcQON3c3Pqi3m7PZR3GJFuWxOhBp8+V+kb3vqyTmGLLkqw7SV1ab7Vmsw5igi1Lwgjc"
-    "5fRzFySN/Hs9kXWAlP0E4LcYz58AsAfAXgCzuPnhKBKph5ut7ssA3o2xNkD8AuF6rDmGJV4fr7IQb1dLxTMmpmo0VEW++yiEBQLH"
-    "EFUc4XVJZ0n2hl5UPFstF94c+vkxjfyhMSu1Gt1aqXixVi4+5RBPA3AjnjLbaHWfSCNbUmxZDKiUip8CeA5AP2ycAzyZTqJkjNc2"
-    "lKBquXjZ9dofAnwxcJAQemQReJnUicDHxa9iRIzNlsUovg8guCzAPWtrmgq6HDBdLlwFcDWRaAbYbcigXrtwJWrM5GR3Jo0sSbBl"
-    "MWjniLEZNsZx/P0pxTHObkPmhZ7k9sng93xpcYHCovFEBkhYjCrLftfrKGKMtUNSsbnZnQobk5OzGjwBS4BuzyOPw5Ldhgxyvc4D"
-    "iPhybns7/0dKcYyzZTEo+i491Ws13EgnjXm2LIY0W63DIObDxlD8nOTIbuu2LAY0vc5R+c5FAPmwcT71cUqREmE/DQ2p3m7POdvO"
-    "Q6DmBRxF5BVorvdahY9SCZeQ8SqLcNL1OgsxZsgDqIDYiz7KuLUd5dTMDL0YawPECoXvYs0xJMH/PqosbQjnE09CHARwJPF1gLt3"
-    "/uK5xbMOAj9WSvnTsZcVP9ELb2R2i0JUWW5Up4qBF7ZMaXjtlwgeSXqdjDTp81mS3ayDxGVPcJPVdHz/WKVS+DnrICbYsiTnmuPz"
-    "cKWy+8usg5gyXie46XBBntqzO/8Wya2sw5hky2JGT+LXDnSh3yucm55mM+tASRi3ssS9ux8Aerr5w/g6yVXIX26VilcOkC0TAW9n"
-    "41UWg3f3jyN7gmsNbLyOLCOO0nEsLd6fxdrydc6WZZQQhyAcymRtx1m225A1MFsWa2C2LNbAbFmsgdmyWAObAPBNyOP1NELkyHVf"
-    "wTmowb51Jfg7Ql6PyLUh4qVIayB/yDrFf5K/+jdV1DH2jpzyCQAAAABJRU5ErkJggg=="
-)
 
 
 
@@ -721,9 +726,9 @@ def run_gui(engine, args):
               for sid, proto, port, name in STREAMS]
 
     root = tk.Tk()
-    root.title(f"HPE Network Quality Monitor  -  peer {args.peer}")
-    root.geometry("1180x760")
-    root.minsize(960, 640)
+    root.title(f"Network Quality Monitor  -  peer {args.peer}")
+    root.geometry("1000x600")
+    root.minsize(480, 320)
     root.configure(bg=BG)
 
     # ---- ttk dark theme ---------------------------------------------------
@@ -742,129 +747,80 @@ def run_gui(engine, args):
 
     # ---- header bar -------------------------------------------------------
     header = tk.Frame(root, bg=BG, padx=14, pady=10)
-    header.pack(fill="x")
-
-    # HPE brand mark (logo from the FlowAtlas UI), embedded as a PNG. Fall back
-    # to a drawn green rectangle if this Tk build can't decode PNG data.
-    try:
-        logo_img = tk.PhotoImage(data=LOGO_PNG_B64)
-        root._nq_logo = logo_img  # keep a reference so it isn't garbage-collected
-        tk.Label(header, image=logo_img, bg=BG).pack(side="left", padx=(0, 12))
-    except tk.TclError:
-        mark = tk.Canvas(header, width=58, height=34, bg=BG, highlightthickness=0)
-        mark.pack(side="left", padx=(0, 12))
-        mark.create_rectangle(3, 9, 54, 26, outline=HPE_GREEN, width=4)
-        tk.Label(header, text="HPE", fg=HPE_GREEN, bg=BG,
-                 font=(FONT, 16, "bold")).pack(side="left")
+    header.pack(fill="x", side="top")
 
     tk.Label(header, text="Network Quality Monitor", fg=TXT, bg=BG,
-             font=(FONT, 16)).pack(side="left", anchor="w")
+             font=(FONT, 17, "bold")).pack(side="left", anchor="w")
 
-    # overall score box on the right
-    scorebox = tk.Frame(header, bg=BG)
-    scorebox.pack(side="right")
+    def do_reset():
+        engine.reset()  # charts + stats clear; they repopulate on the next tick
+
+    reset_btn = tk.Button(header, text="↺  Reset / Clear", command=do_reset,
+                          bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                          activeforeground="white", relief="flat", bd=0,
+                          highlightthickness=0, padx=12, pady=5,
+                          font=(FONT, 9, "bold"), cursor="hand2")
+    reset_btn.pack(side="left", padx=18)
+
+    # right-hand stat cluster: quality text + experience score + composite MOS
+    stats = tk.Frame(header, bg=BG)
+    stats.pack(side="right")
+
+    mos_var = tk.StringVar(value="--")
+    mos_block = tk.Frame(stats, bg=BG)
+    mos_block.pack(side="right", padx=(12, 0))
+    mos_num = tk.Label(mos_block, textvariable=mos_var, font=(FONT, 30, "bold"),
+                       width=4, fg=TXT, bg=BG)
+    mos_num.pack(anchor="center")
+    tk.Label(mos_block, text="MOS (avg)", fg=TXT_DIM, bg=BG,
+             font=(FONT, 8, "bold")).pack(anchor="center")
+
+    score_var = tk.StringVar(value="--")
+    score_lbl = tk.Label(stats, textvariable=score_var, font=(FONT, 34, "bold"),
+                         width=4, fg="white", bg="#555a61")
+    score_lbl.pack(side="right")
+
     label_var = tk.StringVar(value="Starting...")
     sub_var = tk.StringVar(value="")
-    txt = tk.Frame(scorebox, bg=BG)
-    txt.pack(side="right", padx=(12, 0))
-    tk.Label(txt, text="CONNECTION QUALITY", fg=TXT_DIM, bg=BG,
+    txt = tk.Frame(stats, bg=BG)
+    txt.pack(side="right", padx=(0, 12))
+    tk.Label(txt, text="EXPERIENCE", fg=TXT_DIM, bg=BG,
              font=(FONT, 8, "bold")).pack(anchor="e")
     tk.Label(txt, textvariable=label_var, fg=TXT, bg=BG,
              font=(FONT, 17, "bold")).pack(anchor="e")
     tk.Label(txt, textvariable=sub_var, fg=TXT_DIM, bg=BG,
              font=(FONT, 9)).pack(anchor="e")
-    score_var = tk.StringVar(value="--")
-    score_lbl = tk.Label(scorebox, textvariable=score_var, font=(FONT, 34, "bold"),
-                         width=4, fg="white", bg="#555a61")
-    score_lbl.pack(side="right")
 
-    # ---- charts -----------------------------------------------------------
-    charts = tk.Frame(root, bg=BG, padx=12, pady=4)
-    charts.pack(fill="both", expand=True)
-
-    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0, height=210)
-    lat_canvas.pack(fill="both", expand=True, pady=(0, 8))
-
-    bottom = tk.Frame(charts, bg=BG)
-    bottom.pack(fill="both", expand=True)
-    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
-    loss_canvas.pack(side="left", fill="both", expand=True, padx=(0, 4))
-    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
-    jit_canvas.pack(side="left", fill="both", expand=True, padx=(4, 0))
-
-    # ---- table ------------------------------------------------------------
-    cols = ("stream", "status", "rtt", "latency", "jitter", "loss", "late",
-            "score", "mos", "txpps", "rxpps")
-    headings = {
-        "stream": "Stream", "status": "Status", "rtt": "RTT ms", "latency": "1-way ms",
-        "jitter": "Jitter ms", "loss": "Loss %", "late": "Late %", "score": "Score",
-        "mos": "MOS", "txpps": "TX pps", "rxpps": "RX pps",
-    }
-    widths = {
-        "stream": 110, "status": 78, "rtt": 86, "latency": 78, "jitter": 80,
-        "loss": 70, "late": 70, "score": 64, "mos": 58, "txpps": 70, "rxpps": 70,
-    }
-    table_frame = tk.Frame(root, bg=BG, padx=12, pady=6)
-    table_frame.pack(fill="x")
-    tree = ttk.Treeview(table_frame, columns=cols, show="headings",
-                        height=len(STREAMS), style="NQ.Treeview")
-    for c in cols:
-        tree.heading(c, text=headings[c])
-        tree.column(c, width=widths[c], anchor=("w" if c == "stream" else "center"),
-                    stretch=(c == "stream"))
-    tree.pack(fill="x")
-    for band, col, fg in (("ok", "#1e3a30", TXT), ("warn", "#3a341c", TXT),
-                          ("bad", "#3d2622", "#ffb3a6"), ("down", "#2a2d33", TXT_DIM)):
-        tree.tag_configure(band, background=col, foreground=fg)
-    for sid, proto, port, name in STREAMS:
-        tree.insert("", "end", iid=str(sid),
-                    values=(name, "...", "", "", "", "", "", "", "", "", ""))
-
-    # ---- footer -----------------------------------------------------------
+    # ---- footer (pinned to the bottom, before charts claim the middle) ----
     footer = tk.Frame(root, bg=BG, padx=14, pady=6)
-    footer.pack(fill="x")
+    footer.pack(fill="x", side="bottom")
     foot_var = tk.StringVar(value="")
     tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
              font=(FONT, 9)).pack(side="left")
 
-    def fmt(v, nd=1):
-        return f"{v:.{nd}f}"
+    # ---- charts (latency + jitter only; fill the rest, resize freely) -----
+    charts = tk.Frame(root, bg=BG, padx=12, pady=6)
+    charts.pack(fill="both", expand=True)
+    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0)
+    lat_canvas.pack(fill="both", expand=True, pady=(0, 6))
+    jit_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0)
+    jit_canvas.pack(fill="both", expand=True)
 
     def refresh():
         snap = engine.snapshot()
-        for row in snap["rows"]:
-            if not row["connected"]:
-                status, band = "DOWN", "down"
-            elif row["score"] >= 70 and (row["loss"] + row["late"]) < 1.0:
-                status, band = "UP", "ok"
-            elif row["score"] >= 50:
-                status, band = "UP", "warn"
-            else:
-                status, band = "UP", "bad"
-            up = row["connected"]
-            vals = (
-                row["name"], status,
-                fmt(row["rtt_avg"], 2) if up else "-",
-                fmt(row["latency"], 2) if up else "-",
-                fmt(row["jitter"], 2) if up else "-",
-                fmt(row["loss"], 1),
-                fmt(row["late"], 1),
-                fmt(row["score"], 0) if up else "-",
-                fmt(row["mos"], 2) if up else "-",
-                fmt(row["tx_pps"], 0),
-                fmt(row["rx_pps"], 0),
-            )
-            tree.item(str(row["sid"]), values=vals, tags=(band,))
-
         if snap["links_up"] == 0:
             score_var.set("--")
             score_lbl.configure(bg="#555a61")
+            mos_var.set("--")
+            mos_num.configure(fg=TXT_DIM)
             label_var.set("Waiting for peer")
             sub_var.set(f"peer {args.peer} - no streams up yet")
         else:
             o = snap["overall"]
             score_var.set(f"{o:.0f}")
             score_lbl.configure(bg=score_color(o))
+            mos_var.set(f"{snap['overall_mos']:.1f}")
+            mos_num.configure(fg=score_color(o))
             label_var.set(snap["overall_label"])
             sub_var.set(f"worst {snap['worst']:.0f}  -  "
                         f"{snap['links_up']}/{len(STREAMS)} streams up")
@@ -880,9 +836,6 @@ def run_gui(engine, args):
         _draw_chart(lat_canvas, "Latency (RTT, ms)", "rtt", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
-        _draw_chart(loss_canvas, "Loss + late (%)", "loss", series, hist,
-                    view_seconds, now, ymin_floor=2.0, unit="%",
-                    value_fmt=lambda v: f"{v:.0f}")
         _draw_chart(jit_canvas, "Jitter (ms)", "jitter", series, hist,
                     view_seconds, now, ymin_floor=1.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
