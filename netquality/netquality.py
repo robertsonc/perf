@@ -590,6 +590,28 @@ FONT = "Segoe UI"
 # distinct, on-brand line colours per stream
 STREAM_COLORS = {0: "#01A982", 1: "#FF8300", 2: "#00B0E6", 3: "#FEC901"}
 
+# FlowAtlas 'HPE Discover - Las Vegas 2026' brand logo (333x40 PNG, base64),
+# rasterized from the FlowAtlas UI's upper-left brand-logo SVG. Loaded via
+# Tk's native PNG support so the app stays single-file and dependency-free.
+LOGO_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAIsAAAAoCAYAAADOkQm/AAAABmJLR0QA/wD/AP+gvaeTAAAEAElEQVR4nO3bP2wbVQAG8O87J7Zb"
+    "O66d0hQqJQghdSkjggIS6gAqVIiFv1IHspAyMjEUsWRhoFIZoUhFaiVUBSRExVQ6Ak1A/BEtggGhLoBIiH1uLv4Tx/cxNGJA3J3r"
+    "e3dX4/eTMvn5vc/Op3tn35mu1/kMQYhGtVR8PvBxQ1yv8ziA14JzaKla2vVe1DwNrz1P8LjJbP8moOOA64DWBa6Susb+1kqlUvkr"
+    "7tzuRvcZUK+YyGmceGYCwGPBA/BnKjmgAwRDcvDbASe6Fwx5PQYQgKB/FpQAOfl+Y7OzTOB8r1X4YN8+bgwzt6g5hv0/skRdcrLO"
+    "8D+Ro/AIhHcmd3V/bXidVyXlsg5lmi2LeXcQON3c3Pqi3m7PZR3GJFuWxOhBp8+V+kb3vqyTmGLLkqw7SV1ab7Vmsw5igi1Lwgjc"
+    "5fRzFySN/Hs9kXWAlP0E4LcYz58AsAfAXgCzuPnhKBKph5ut7ssA3o2xNkD8AuF6rDmGJV4fr7IQb1dLxTMmpmo0VEW++yiEBQLH"
+    "EFUc4XVJZ0n2hl5UPFstF94c+vkxjfyhMSu1Gt1aqXixVi4+5RBPA3AjnjLbaHWfSCNbUmxZDKiUip8CeA5AP2ycAzyZTqJkjNc2"
+    "lKBquXjZ9dofAnwxcJAQemQReJnUicDHxa9iRIzNlsUovg8guCzAPWtrmgq6HDBdLlwFcDWRaAbYbcigXrtwJWrM5GR3Jo0sSbBl"
+    "MWjniLEZNsZx/P0pxTHObkPmhZ7k9sng93xpcYHCovFEBkhYjCrLftfrKGKMtUNSsbnZnQobk5OzGjwBS4BuzyOPw5Ldhgxyvc4D"
+    "iPhybns7/0dKcYyzZTEo+i491Ws13EgnjXm2LIY0W63DIObDxlD8nOTIbuu2LAY0vc5R+c5FAPmwcT71cUqREmE/DQ2p3m7POdvO"
+    "Q6DmBRxF5BVorvdahY9SCZeQ8SqLcNL1OgsxZsgDqIDYiz7KuLUd5dTMDL0YawPECoXvYs0xJMH/PqosbQjnE09CHARwJPF1gLt3"
+    "/uK5xbMOAj9WSvnTsZcVP9ELb2R2i0JUWW5Up4qBF7ZMaXjtlwgeSXqdjDTp81mS3ayDxGVPcJPVdHz/WKVS+DnrICbYsiTnmuPz"
+    "cKWy+8usg5gyXie46XBBntqzO/8Wya2sw5hky2JGT+LXDnSh3yucm55mM+tASRi3ssS9ux8Aerr5w/g6yVXIX26VilcOkC0TAW9n"
+    "41UWg3f3jyN7gmsNbLyOLCOO0nEsLd6fxdrydc6WZZQQhyAcymRtx1m225A1MFsWa2C2LNbAbFmsgdmyWAObAPBNyOP1NELkyHVf"
+    "wTmowb51Jfg7Ql6PyLUh4qVIayB/yDrFf5K/+jdV1DH2jpzyCQAAAABJRU5ErkJggg=="
+)
+
+
 
 def _nice_ceiling(v):
     """Round a value up to a clean 1/2/2.5/5 * 10^n axis maximum."""
@@ -722,17 +744,21 @@ def run_gui(engine, args):
     header = tk.Frame(root, bg=BG, padx=14, pady=10)
     header.pack(fill="x")
 
-    # HPE-style brand mark: green rectangle element + wordmark
-    mark = tk.Canvas(header, width=58, height=34, bg=BG, highlightthickness=0)
-    mark.pack(side="left", padx=(0, 12))
-    mark.create_rectangle(3, 9, 54, 26, outline=HPE_GREEN, width=4)
+    # HPE brand mark (logo from the FlowAtlas UI), embedded as a PNG. Fall back
+    # to a drawn green rectangle if this Tk build can't decode PNG data.
+    try:
+        logo_img = tk.PhotoImage(data=LOGO_PNG_B64)
+        root._nq_logo = logo_img  # keep a reference so it isn't garbage-collected
+        tk.Label(header, image=logo_img, bg=BG).pack(side="left", padx=(0, 12))
+    except tk.TclError:
+        mark = tk.Canvas(header, width=58, height=34, bg=BG, highlightthickness=0)
+        mark.pack(side="left", padx=(0, 12))
+        mark.create_rectangle(3, 9, 54, 26, outline=HPE_GREEN, width=4)
+        tk.Label(header, text="HPE", fg=HPE_GREEN, bg=BG,
+                 font=(FONT, 16, "bold")).pack(side="left")
 
-    brand = tk.Frame(header, bg=BG)
-    brand.pack(side="left", anchor="w")
-    tk.Label(brand, text="HPE", fg=HPE_GREEN, bg=BG,
-             font=(FONT, 16, "bold")).pack(side="left")
-    tk.Label(brand, text="  Network Quality Monitor", fg=TXT, bg=BG,
-             font=(FONT, 16)).pack(side="left")
+    tk.Label(header, text="Network Quality Monitor", fg=TXT, bg=BG,
+             font=(FONT, 16)).pack(side="left", anchor="w")
 
     # overall score box on the right
     scorebox = tk.Frame(header, bg=BG)
