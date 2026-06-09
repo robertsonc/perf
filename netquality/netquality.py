@@ -147,13 +147,16 @@ class StreamStats:
     treats (loss + late) as the effective impairment.
     """
 
-    def __init__(self, window=10.0, timeout=2.0):
+    def __init__(self, window=10.0, timeout=2.0, target_pps=None):
         self.lock = threading.Lock()
         self.window = window          # seconds of history kept for rates/loss
         self.timeout = timeout        # an un-echoed probe older than this = lost
+        self.target_pps = target_pps  # offered probe rate (for throughput ratio)
+        self.window_start = time.time()  # for accurate rates before window fills
 
         self.rtt_samples = deque()    # (t_wall, rtt_ms) for on-time echoes only
         self.tx_events = deque()      # t_wall of probes sent
+        self.connect_samples = deque(maxlen=8)  # recent TCP connect times (ms)
 
         # Windowed per-probe outcomes. `resolved_order` keeps insertion order so
         # we can trim by time; `state` maps seq -> 'recv'|'lost'|'late' and is
@@ -223,10 +226,16 @@ class StreamStats:
                 self.cum_lost += 1
             self._trim_locked()
 
+    def on_connect(self, dt_ms):
+        """Record a TCP connection-establishment time sample (client side)."""
+        with self.lock:
+            self.connect_samples.append(dt_ms)
+
     # -- consumer (called from UI thread) ---------------------------------
     def snapshot(self):
         with self.lock:
             self._trim_locked()
+            now = time.time()
             rtts = [r for _, r in self.rtt_samples]
             recv = lost = late = 0
             for st in self.state.values():
@@ -239,8 +248,32 @@ class StreamStats:
             decided = recv + lost + late
             loss = (lost / decided * 100.0) if decided else 0.0
             late_pct = (late / decided * 100.0) if decided else 0.0
-            connected = (time.time() - self.last_echo_t) < self.timeout if self.last_echo_t else False
+            connected = (now - self.last_echo_t) < self.timeout if self.last_echo_t else False
             avg = (sum(rtts) / len(rtts)) if rtts else 0.0
+            # RTT standard deviation over the window (PQI variance term).
+            if len(rtts) > 1:
+                rtt_std = math.sqrt(sum((r - avg) ** 2 for r in rtts) / len(rtts))
+            else:
+                rtt_std = 0.0
+            # Stall rate: deliveries >= baseline + 200ms are almost certainly TCP
+            # retransmissions (RTO / fast-retransmit) - the app-level retrans proxy.
+            if rtts:
+                stall_thr = min(rtts) + 200.0
+                stall_pct = sum(1 for r in rtts if r > stall_thr) / len(rtts) * 100.0
+            else:
+                stall_pct = 0.0
+            # Don't let a partially-filled window understate the packet rates.
+            span = max(1e-3, min(self.window, now - self.window_start))
+            tx_pps = len(self.tx_events) / span
+            rx_pps = recv / span
+            # Achieved echo rate vs offered probe rate = effective throughput
+            # under backpressure (sendall stalls drag this below 1.0).
+            if self.target_pps:
+                tput_ratio = max(0.0, min(1.0, rx_pps / self.target_pps))
+            else:
+                tput_ratio = 1.0
+            conn_list = sorted(self.connect_samples)
+            connect_ms = conn_list[len(conn_list) // 2] if conn_list else None
             return {
                 "connected": connected,
                 "rtt_avg": avg,
@@ -248,10 +281,14 @@ class StreamStats:
                 "rtt_max": max(rtts) if rtts else 0.0,
                 "latency": avg / 2.0,
                 "jitter": self.jitter,
+                "rtt_std": rtt_std,
+                "stall_pct": stall_pct,
+                "tput_ratio": tput_ratio,
+                "connect_ms": connect_ms,
                 "loss": loss,
                 "late": late_pct,
-                "tx_pps": len(self.tx_events) / self.window,
-                "rx_pps": recv / self.window,
+                "tx_pps": tx_pps,
+                "rx_pps": rx_pps,
                 "samples": len(rtts),
                 "cum_tx": self.cum_tx,
                 "cum_recv": self.cum_recv,
@@ -267,9 +304,11 @@ class StreamStats:
             self.resolved_order.clear()
             self.state.clear()
             self.pending.clear()
+            self.connect_samples.clear()
             self.jitter = 0.0
             self.last_rtt = None
             self.last_echo_t = 0.0
+            self.window_start = time.time()
             self.cum_tx = self.cum_recv = self.cum_lost = self.cum_late = 0
 
     def _trim_locked(self):
@@ -308,6 +347,39 @@ def quality_score(latency_ms, loss_pct, jitter_ms):
     mos = max(1.0, min(4.5, mos))
     label = score_label(R)
     return R, mos, label
+
+
+def pqi_score(latency_ms, rtt_std_ms, retrans_pct, tput_ratio, connect_ms, rtt_ms):
+    """Path Quality Index (PQI) for TCP streams, 0-100.
+
+    MOS is a media metric and the wrong lens for TCP, which converts loss into
+    delay via retransmission. PQI instead blends what actually shapes
+    application experience on a TCP path:
+
+      * RTT             - same delay-impairment curve as the E-model Id term.
+      * RTT variance    - stddev over the window; erratic RTT = queue churn.
+      * retransmission% - app-level proxy: deliveries stalled >= ~RTO beyond the
+                          window's baseline RTT, plus lost/late probes.
+      * eff. throughput - achieved echo rate / offered probe rate; TCP
+                          backpressure (blocked sends) drags this below 1.
+      * connect time    - establishment time beyond ~RTT means SYN loss
+                          (each SYN retry costs a full RTO, seconds at worst).
+
+    Returns (pqi, label) with the same 0-100 bands as the R-factor score.
+    """
+    d = latency_ms
+    rtt_pen = 0.024 * d + (0.11 * (d - 177.3) if d > 177.3 else 0.0)
+    var_pen = min(20.0, 0.3 * rtt_std_ms)
+    p = max(0.0, min(1.0, retrans_pct / 100.0))
+    retx_pen = 30.0 * math.log(1.0 + 15.0 * p)
+    tput_pen = 25.0 * (1.0 - max(0.0, min(1.0, tput_ratio)))
+    conn_pen = 0.0
+    if connect_ms is not None:
+        excess = max(0.0, connect_ms - (rtt_ms + 50.0))
+        conn_pen = min(15.0, excess / 100.0)
+    pqi = 100.0 - rtt_pen - var_pen - retx_pen - tput_pen - conn_pen
+    pqi = max(0.0, min(100.0, pqi))
+    return pqi, score_label(pqi)
 
 
 def score_label(r):
@@ -443,6 +515,7 @@ class TCPStream:
         self.threads = [
             threading.Thread(target=self._server_loop, name=f"{self.name}-srv", daemon=True),
             threading.Thread(target=self._client_manager, name=f"{self.name}-cli", daemon=True),
+            threading.Thread(target=self._connect_sampler, name=f"{self.name}-syn", daemon=True),
         ]
         for t in self.threads:
             t.start()
@@ -489,14 +562,28 @@ class TCPStream:
                     except OSError:
                         return
 
+    # -- connection-establishment sampler (PQI input) ----------------------
+    def _connect_sampler(self):
+        """Every ~15s, time a throwaway TCP handshake to the peer port."""
+        while not self.stop.wait(15.0):
+            t0 = time.monotonic()
+            try:
+                s = socket.create_connection((self.peer, self.port), timeout=3.0)
+                self.stats.on_connect((time.monotonic() - t0) * 1000.0)
+                s.close()
+            except OSError:
+                pass  # peer down; connection health shows via the main stream
+
     # -- client side: originate probes ------------------------------------
     def _client_manager(self):
         while not self.stop.is_set():
+            t0 = time.monotonic()
             try:
                 cs = socket.create_connection((self.peer, self.port), timeout=2.0)
             except OSError:
                 self.stop.wait(1.0)
                 continue
+            self.stats.on_connect((time.monotonic() - t0) * 1000.0)
             cs.settimeout(0.5)
             try:
                 cs.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -567,7 +654,7 @@ class Engine:
         self.history_lock = threading.Lock()
         for cfg in STREAMS:
             sid, proto, port, name = cfg
-            st = StreamStats(window=window, timeout=timeout)
+            st = StreamStats(window=window, timeout=timeout, target_pps=pps)
             self.stats[sid] = st
             if proto == "UDP":
                 self.streams.append(UDPStream(cfg, peer, bind, size, interval, st, self.stop))
@@ -614,30 +701,46 @@ class Engine:
         """Return per-stream snapshots + overall aggregate quality."""
         rows = []
         scores = []
-        moses = []
+        proto_mos = {"UDP": [], "TCP": []}
+        proto_score = {"UDP": [], "TCP": []}
         tot_tx = tot_recv = tot_lost = tot_late = 0
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
             eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
-            r, mos, label = quality_score(snap["latency"], eff, snap["jitter"])
+            if proto == "TCP":
+                # TCP gets a Path Quality Index, not MOS: retransmissions show
+                # up as stalls/loss/late at the probe level, plus throughput
+                # backpressure and connection-establishment time.
+                retrans = min(100.0, snap["stall_pct"] + eff)
+                score, label = pqi_score(snap["latency"], snap["rtt_std"], retrans,
+                                         snap["tput_ratio"], snap["connect_ms"],
+                                         snap["rtt_avg"])
+                mos = None
+            else:
+                score, mos, label = quality_score(snap["latency"], eff, snap["jitter"])
             snap.update(sid=sid, proto=proto, port=port, name=name,
-                        score=r, mos=mos, label=label, eff_loss=eff)
+                        score=score, mos=mos, label=label, eff_loss=eff)
             rows.append(snap)
             tot_tx += snap["cum_tx"]
             tot_recv += snap["cum_recv"]
             tot_lost += snap["cum_lost"]
             tot_late += snap["cum_late"]
             if snap["connected"] and snap["samples"] > 0:
-                scores.append(r)
-                moses.append(mos)
+                scores.append(score)
+                if mos is not None:
+                    proto_mos[proto].append(mos)
+                proto_score[proto].append(score)
+        # Per-protocol headline numbers: UDP keeps MOS (a media metric), TCP
+        # gets the average PQI of its live streams.
+        udp_mos = sum(proto_mos["UDP"]) / len(proto_mos["UDP"]) if proto_mos["UDP"] else None
+        udp_score = sum(proto_score["UDP"]) / len(proto_score["UDP"]) if proto_score["UDP"] else None
+        tcp_pqi = sum(proto_score["TCP"]) / len(proto_score["TCP"]) if proto_score["TCP"] else None
         if scores:
             overall = sum(scores) / len(scores)
             worst = min(scores)
-            overall_mos = sum(moses) / len(moses)   # composite MOS, instant average
         else:
             overall = 0.0
             worst = 0.0
-            overall_mos = 0.0
         decided = tot_recv + tot_lost + tot_late
         totals = {
             "tx": tot_tx, "recv": tot_recv, "lost": tot_lost, "late": tot_late,
@@ -647,7 +750,9 @@ class Engine:
         return {
             "rows": rows,
             "overall": overall,
-            "overall_mos": overall_mos,
+            "udp_mos": udp_mos,
+            "udp_score": udp_score,
+            "tcp_pqi": tcp_pqi,
             "worst": worst,
             "overall_label": score_label(overall) if scores else "No link",
             "uptime": time.time() - self.start_time,
@@ -872,14 +977,23 @@ def run_gui(engine, args):
     stats = tk.Frame(header, bg=BG)
     stats.pack(side="right")
 
-    mos_var = tk.StringVar(value="--")
+    # Per-protocol headline metrics: UDP keeps MOS (a media metric); TCP gets
+    # a Path Quality Index (RTT, RTT variance, retransmissions, throughput,
+    # connection establishment) - MOS is the wrong lens for TCP.
+    udp_mos_var = tk.StringVar(value="--")
+    tcp_pqi_var = tk.StringVar(value="--")
     mos_block = tk.Frame(stats, bg=BG)
-    mos_block.pack(side="right", padx=(12, 0))
-    mos_num = tk.Label(mos_block, textvariable=mos_var, font=(FONT, 30, "bold"),
-                       width=4, fg=TXT, bg=BG)
-    mos_num.pack(anchor="center")
-    tk.Label(mos_block, text="MOS (avg)", fg=TXT_DIM, bg=BG,
-             font=(FONT, 8, "bold")).pack(anchor="center")
+    mos_block.pack(side="right", padx=(14, 0))
+    tk.Label(mos_block, text="UDP MOS", fg=TXT_DIM, bg=BG,
+             font=(FONT, 8, "bold")).grid(row=0, column=0, sticky="e", padx=(0, 5))
+    udp_mos_num = tk.Label(mos_block, textvariable=udp_mos_var,
+                           font=(FONT, 14, "bold"), fg=TXT, bg=BG)
+    udp_mos_num.grid(row=0, column=1, sticky="w")
+    tk.Label(mos_block, text="TCP PQI", fg=TXT_DIM, bg=BG,
+             font=(FONT, 8, "bold")).grid(row=1, column=0, sticky="e", padx=(0, 5))
+    tcp_pqi_num = tk.Label(mos_block, textvariable=tcp_pqi_var,
+                           font=(FONT, 14, "bold"), fg=TXT, bg=BG)
+    tcp_pqi_num.grid(row=1, column=1, sticky="w")
 
     score_var = tk.StringVar(value="--")
     score_lbl = tk.Label(stats, textvariable=score_var, font=(FONT, 34, "bold"),
@@ -934,19 +1048,29 @@ def run_gui(engine, args):
 
     def refresh():
         snap = engine.snapshot()
+        def set_metric(var, num, value, fmt, color_score):
+            if value is None:
+                var.set("--")
+                num.configure(fg=TXT_DIM)
+            else:
+                var.set(fmt.format(value))
+                num.configure(fg=score_color(color_score))
+
         if snap["links_up"] == 0:
             score_var.set("--")
             score_lbl.configure(bg="#555a61")
-            mos_var.set("--")
-            mos_num.configure(fg=TXT_DIM)
+            set_metric(udp_mos_var, udp_mos_num, None, "", 0)
+            set_metric(tcp_pqi_var, tcp_pqi_num, None, "", 0)
             label_var.set("Waiting for peer")
             sub_var.set(f"peer {args.peer} - no streams up yet")
         else:
             o = snap["overall"]
             score_var.set(f"{o:.0f}")
             score_lbl.configure(bg=score_color(o))
-            mos_var.set(f"{snap['overall_mos']:.1f}")
-            mos_num.configure(fg=score_color(o))
+            set_metric(udp_mos_var, udp_mos_num, snap["udp_mos"], "{:.1f}",
+                       snap["udp_score"] or 0)
+            set_metric(tcp_pqi_var, tcp_pqi_num, snap["tcp_pqi"], "{:.0f}",
+                       snap["tcp_pqi"] or 0)
             label_var.set(snap["overall_label"])
             sub_var.set(f"worst {snap['worst']:.0f}  -  "
                         f"{snap['links_up']}/{len(STREAMS)} streams up")
@@ -1001,8 +1125,11 @@ def run_console(engine, args):
             snap = engine.snapshot()
             print("\033[2J\033[H", end="")  # clear screen
             o = snap["overall"]
+            um = f"{snap['udp_mos']:.2f}" if snap["udp_mos"] is not None else "-"
+            tq = f"{snap['tcp_pqi']:.0f}" if snap["tcp_pqi"] is not None else "-"
             print(f"  OVERALL QUALITY: {o:5.1f}/100  {snap['overall_label']:<10}"
-                  f"  ({snap['links_up']}/{len(STREAMS)} streams up, worst {snap['worst']:.0f})")
+                  f"  ({snap['links_up']}/{len(STREAMS)} streams up, worst {snap['worst']:.0f})"
+                  f"   UDP MOS {um}   TCP PQI {tq}")
             print("  " + "-" * 100)
             print(f"  {'Stream':<10}{'Status':<8}{'RTT ms':>9}{'1-way':>9}"
                   f"{'Jitter':>9}{'Loss %':>9}{'Late %':>9}{'Score':>7}{'MOS':>6}"
@@ -1010,10 +1137,11 @@ def run_console(engine, args):
             print("  " + "-" * 100)
             for r in snap["rows"]:
                 st = "UP" if r["connected"] else "DOWN"
+                mos_s = f"{r['mos']:.2f}" if r["mos"] is not None else "-"
                 if r["connected"]:
                     print(f"  {r['name']:<10}{st:<8}{r['rtt_avg']:>9.2f}{r['latency']:>9.2f}"
                           f"{r['jitter']:>9.2f}{r['loss']:>9.1f}{r['late']:>9.1f}{r['score']:>7.0f}"
-                          f"{r['mos']:>6.2f}{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
+                          f"{mos_s:>6}{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
                 else:
                     print(f"  {r['name']:<10}{st:<8}{'-':>9}{'-':>9}{'-':>9}"
                           f"{r['loss']:>9.1f}{r['late']:>9.1f}{'-':>7}{'-':>6}"

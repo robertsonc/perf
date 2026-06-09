@@ -33,7 +33,20 @@ The dashboard shows **three live + history charts** with one line per stream:
 plus, in the header:
 
 - a big colour-coded **Experience score** (0–100, green = excellent → red = bad),
-- a composite **MOS (avg)** — the average MOS across the active streams,
+- a **UDP MOS** (E-model, averaged over the UDP streams) and a **TCP PQI** —
+  MOS is a media metric and the wrong lens for TCP, which converts loss into
+  delay via retransmission, so TCP streams get a **Path Quality Index**
+  (0–100) instead, built from:
+  - RTT (same delay-impairment curve as the E-model),
+  - RTT variance (stddev over the window),
+  - retransmission rate — measured at the app layer as *stalled deliveries*
+    (echoes arriving ≥ ~RTO beyond the window's baseline RTT) plus lost/late
+    probes,
+  - effective throughput (achieved echo rate vs offered probe rate; TCP
+    backpressure drags this below 1),
+  - TCP connection-establishment time (every reconnect is timed, plus a
+    throwaway handshake is sampled every ~15 s per TCP port; establishment
+    well beyond the RTT means SYN loss),
 - a **Reset / Clear** button that wipes the charts and all accumulated
   loss/latency/jitter stats so a demo can start from a clean slate,
 - a **Totals** button that toggles a per-stream lifetime table (sent / received
