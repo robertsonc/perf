@@ -614,7 +614,8 @@ class Engine:
         """Return per-stream snapshots + overall aggregate quality."""
         rows = []
         scores = []
-        moses = []
+        proto_mos = {"UDP": [], "TCP": []}
+        proto_score = {"UDP": [], "TCP": []}
         tot_tx = tot_recv = tot_lost = tot_late = 0
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
@@ -629,11 +630,19 @@ class Engine:
             tot_late += snap["cum_late"]
             if snap["connected"] and snap["samples"] > 0:
                 scores.append(r)
-                moses.append(mos)
+                proto_mos[proto].append(mos)
+                proto_score[proto].append(r)
+        # Per-protocol MOS (average over that protocol's live streams), and a
+        # composite that is the average of the two protocol MOS values.
+        udp_mos = sum(proto_mos["UDP"]) / len(proto_mos["UDP"]) if proto_mos["UDP"] else None
+        tcp_mos = sum(proto_mos["TCP"]) / len(proto_mos["TCP"]) if proto_mos["TCP"] else None
+        udp_score = sum(proto_score["UDP"]) / len(proto_score["UDP"]) if proto_score["UDP"] else None
+        tcp_score = sum(proto_score["TCP"]) / len(proto_score["TCP"]) if proto_score["TCP"] else None
+        proto_moses = [m for m in (udp_mos, tcp_mos) if m is not None]
         if scores:
             overall = sum(scores) / len(scores)
             worst = min(scores)
-            overall_mos = sum(moses) / len(moses)   # composite MOS, instant average
+            overall_mos = sum(proto_moses) / len(proto_moses)
         else:
             overall = 0.0
             worst = 0.0
@@ -648,6 +657,10 @@ class Engine:
             "rows": rows,
             "overall": overall,
             "overall_mos": overall_mos,
+            "udp_mos": udp_mos,
+            "tcp_mos": tcp_mos,
+            "udp_score": udp_score,
+            "tcp_score": tcp_score,
             "worst": worst,
             "overall_label": score_label(overall) if scores else "No link",
             "uptime": time.time() - self.start_time,
@@ -872,14 +885,29 @@ def run_gui(engine, args):
     stats = tk.Frame(header, bg=BG)
     stats.pack(side="right")
 
+    # MOS cluster: big composite on top, distinct UDP / TCP MOS beneath it
     mos_var = tk.StringVar(value="--")
+    udp_mos_var = tk.StringVar(value="--")
+    tcp_mos_var = tk.StringVar(value="--")
     mos_block = tk.Frame(stats, bg=BG)
     mos_block.pack(side="right", padx=(12, 0))
-    mos_num = tk.Label(mos_block, textvariable=mos_var, font=(FONT, 30, "bold"),
-                       width=4, fg=TXT, bg=BG)
+    mos_num = tk.Label(mos_block, textvariable=mos_var, font=(FONT, 24, "bold"),
+                       fg=TXT, bg=BG)
     mos_num.pack(anchor="center")
     tk.Label(mos_block, text="MOS (avg)", fg=TXT_DIM, bg=BG,
              font=(FONT, 8, "bold")).pack(anchor="center")
+    proto_row = tk.Frame(mos_block, bg=BG)
+    proto_row.pack(anchor="center", pady=2)
+    tk.Label(proto_row, text="UDP", fg=TXT_DIM, bg=BG,
+             font=(FONT, 8, "bold")).pack(side="left")
+    udp_mos_num = tk.Label(proto_row, textvariable=udp_mos_var,
+                           font=(FONT, 10, "bold"), fg=TXT, bg=BG)
+    udp_mos_num.pack(side="left", padx=(3, 8))
+    tk.Label(proto_row, text="TCP", fg=TXT_DIM, bg=BG,
+             font=(FONT, 8, "bold")).pack(side="left")
+    tcp_mos_num = tk.Label(proto_row, textvariable=tcp_mos_var,
+                           font=(FONT, 10, "bold"), fg=TXT, bg=BG)
+    tcp_mos_num.pack(side="left", padx=3)
 
     score_var = tk.StringVar(value="--")
     score_lbl = tk.Label(stats, textvariable=score_var, font=(FONT, 34, "bold"),
@@ -934,11 +962,21 @@ def run_gui(engine, args):
 
     def refresh():
         snap = engine.snapshot()
+        def set_proto_mos(var, num, mos, score):
+            if mos is None:
+                var.set("--")
+                num.configure(fg=TXT_DIM)
+            else:
+                var.set(f"{mos:.1f}")
+                num.configure(fg=score_color(score))
+
         if snap["links_up"] == 0:
             score_var.set("--")
             score_lbl.configure(bg="#555a61")
             mos_var.set("--")
             mos_num.configure(fg=TXT_DIM)
+            set_proto_mos(udp_mos_var, udp_mos_num, None, 0)
+            set_proto_mos(tcp_mos_var, tcp_mos_num, None, 0)
             label_var.set("Waiting for peer")
             sub_var.set(f"peer {args.peer} - no streams up yet")
         else:
@@ -947,6 +985,8 @@ def run_gui(engine, args):
             score_lbl.configure(bg=score_color(o))
             mos_var.set(f"{snap['overall_mos']:.1f}")
             mos_num.configure(fg=score_color(o))
+            set_proto_mos(udp_mos_var, udp_mos_num, snap["udp_mos"], snap["udp_score"] or 0)
+            set_proto_mos(tcp_mos_var, tcp_mos_num, snap["tcp_mos"], snap["tcp_score"] or 0)
             label_var.set(snap["overall_label"])
             sub_var.set(f"worst {snap['worst']:.0f}  -  "
                         f"{snap['links_up']}/{len(STREAMS)} streams up")
@@ -1001,8 +1041,11 @@ def run_console(engine, args):
             snap = engine.snapshot()
             print("\033[2J\033[H", end="")  # clear screen
             o = snap["overall"]
+            um = f"{snap['udp_mos']:.2f}" if snap["udp_mos"] is not None else "-"
+            tm = f"{snap['tcp_mos']:.2f}" if snap["tcp_mos"] is not None else "-"
             print(f"  OVERALL QUALITY: {o:5.1f}/100  {snap['overall_label']:<10}"
-                  f"  ({snap['links_up']}/{len(STREAMS)} streams up, worst {snap['worst']:.0f})")
+                  f"  ({snap['links_up']}/{len(STREAMS)} streams up, worst {snap['worst']:.0f})"
+                  f"   MOS: avg {snap['overall_mos']:.2f}  UDP {um}  TCP {tm}")
             print("  " + "-" * 100)
             print(f"  {'Stream':<10}{'Status':<8}{'RTT ms':>9}{'1-way':>9}"
                   f"{'Jitter':>9}{'Loss %':>9}{'Late %':>9}{'Score':>7}{'MOS':>6}"

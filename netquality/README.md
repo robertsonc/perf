@@ -33,7 +33,11 @@ The dashboard shows **three live + history charts** with one line per stream:
 plus, in the header:
 
 - a big colour-coded **Experience score** (0–100, green = excellent → red = bad),
-- a composite **MOS (avg)** — the average MOS across the active streams,
+- distinct **UDP MOS** and **TCP MOS** (each the average over that protocol's
+  live streams), plus a composite **MOS (avg)** — the average of the two.
+  Splitting by protocol is deliberate: loss shows up directly in the UDP MOS,
+  while TCP hides loss as added latency, so the two diverging is itself a
+  diagnostic signal,
 - a **Reset / Clear** button that wipes the charts and all accumulated
   loss/latency/jitter stats so a demo can start from a clean slate,
 - a **Totals** button that toggles a per-stream lifetime table (sent / received
