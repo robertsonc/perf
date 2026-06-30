@@ -185,18 +185,69 @@ Bad below.
 --udp-ports A,B    the two UDP ports (default 30201,30202)
 --tcp-ports A,B    the two TCP ports (default 30101,30102)
 --pps N            probes per second per stream (default 50)
---size N           probe packet size in bytes (default 200)
+--size N           probe packet size in bytes (default 200; e.g. 8972 for jumbo)
+--dont-fragment    set the DF bit on UDP (oversized probes dropped, not split)
 --window SECONDS   sliding window for loss/jitter/rate (default 10)
 --timeout SECONDS  un-echoed probe -> lost after this (default 2)
 --loss-deadband P  combined loss+late below P%% reads as 0 (default 0.5; 0 off)
 --history SECONDS  span of the live/history charts (default 300)
 --refresh-ms N     UI refresh interval (default 500)
 --no-gui           force console UI
+--mtu-sweep        one-shot: find the largest UDP payload that crosses unfragmented
+--sweep-min N      MTU sweep lower bound, payload bytes (default 1400)
+--sweep-max N      MTU sweep upper bound, payload bytes (default 9000)
 ```
 
 At the defaults each stream is ~50 packets/s × 200 B ≈ 10 KB/s each way, i.e.
 ~80 KB/s total for the box — light enough to leave running, dense enough to
 resolve loss and jitter well. Bump `--pps` / `--size` for a heavier load test.
+
+## Jumbo-frame testing
+
+Every probe stamps its own intended size into the packet, and the reflector
+stamps back the number of bytes it actually received — so each end can confirm
+full-size datagrams are crossing **in both directions**, not just that *some*
+packet arrived.
+
+Run on both ends with a jumbo payload and the Don't-Fragment bit set:
+
+```
+python netquality.py --peer 10.0.0.2 --size 8972 --dont-fragment
+```
+
+`8972` UDP payload + 8 (UDP) + 20 (IP) = a **9000-byte jumbo frame**. With
+`--dont-fragment`, a probe that hits a hop with MTU < 9000 is **dropped instead
+of fragmented**, so loss going to ~100% at jumbo size (while the link is clean
+at small sizes) means the jumbo path is broken. Without DF, the OS would
+silently fragment and reassemble, hiding the problem.
+
+What to look at:
+
+- **Status bar:** `frame 8972 B  DF on  size ✓ verified` once full-size
+  datagrams have round-tripped on every UDP stream.
+- **Totals table** (the *Totals* button): per stream, **TX B** (sent),
+  **Peer RX B** (bytes the far end received — forward path), **My RX B** (bytes
+  this end received — return path), and **Size** = `OK` when both match the
+  configured size, or `⚠ N` on any mismatch.
+
+### Path-MTU sweep
+
+To discover the largest frame a path actually carries, point the sweep at a peer
+that's running Network Vitals:
+
+```
+python netquality.py --peer 10.0.0.2 --mtu-sweep
+```
+
+It binary-searches the UDP payload size with DF set (binding an ephemeral port,
+so it can run alongside a live instance) and reports the largest payload that
+crosses unfragmented plus the forward path MTU, e.g.:
+
+```
+Largest UDP payload that traverses unfragmented:  8972 bytes
+Forward path MTU (this host -> peer):            ~9000 bytes
+=> Jumbo frames (>=9000) confirmed end to end.  ✓
+```
 
 ## Windows firewall
 
