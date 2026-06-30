@@ -52,8 +52,14 @@ from collections import deque
 # the originator computes RTT = now - ts_ns purely against its OWN clock.
 
 MAGIC = 0x4E51_5631  # "NQV1"
-HEADER = struct.Struct("!IBBIQ")
-HEADER_LEN = HEADER.size  # 18 bytes
+# magic(I) type(B) sid(B) seq(I) ts_ns(Q) psize(H) rxsize(H)
+#   psize  = the total size this packet is meant to be (self-describing; lets
+#            the receiver assert it got a full-size datagram - jumbo testing).
+#   rxsize = bytes the reflector actually received (0 in a probe; filled into the
+#            echo) so the originator learns the size delivered to the far end.
+HEADER = struct.Struct("!IBBIQHH")
+HEADER_LEN = HEADER.size  # 22 bytes
+MAX_SIZE = 65535          # psize/rxsize are uint16
 
 TYPE_PROBE = 1
 TYPE_ECHO = 2
@@ -93,22 +99,29 @@ def ports_summary():
     return f"UDP {udp}  TCP {tcp}"
 
 
-def build_packet(ptype, sid, seq, ts_ns, size):
-    """Build a fixed-size packet padded out to `size` bytes."""
-    hdr = HEADER.pack(MAGIC, ptype, sid, seq, ts_ns)
+def build_packet(ptype, sid, seq, ts_ns, size, rxsize=0):
+    """Build a fixed-size packet padded out to `size` bytes.
+
+    `size` is also stamped into the header (psize) so the receiver can confirm
+    it got a full-size datagram; `rxsize` is the size the reflector observed
+    (set only on echoes).
+    """
     if size < HEADER_LEN:
         size = HEADER_LEN
+    if size > MAX_SIZE:
+        size = MAX_SIZE
+    hdr = HEADER.pack(MAGIC, ptype, sid, seq, ts_ns, size, min(rxsize, MAX_SIZE))
     return hdr + b"\x00" * (size - HEADER_LEN)
 
 
 def parse_header(data):
-    """Return (ptype, sid, seq, ts_ns) or None if it is not our traffic."""
+    """Return (ptype, sid, seq, ts_ns, psize, rxsize) or None if not our traffic."""
     if len(data) < HEADER_LEN:
         return None
-    magic, ptype, sid, seq, ts_ns = HEADER.unpack(data[:HEADER_LEN])
+    magic, ptype, sid, seq, ts_ns, psize, rxsize = HEADER.unpack(data[:HEADER_LEN])
     if magic != MAGIC:
         return None
-    return ptype, sid, seq, ts_ns
+    return ptype, sid, seq, ts_ns, psize, rxsize
 
 
 # Socket buffer size. Windows defaults to a small (~64 KB) UDP receive buffer.
@@ -127,6 +140,23 @@ def enlarge_socket_buffers(sock):
             sock.setsockopt(socket.SOL_SOCKET, opt, SOCK_BUF_BYTES)
         except OSError:
             pass
+
+
+def set_dont_fragment(sock):
+    """Set the IPv4 Don't-Fragment bit so oversized datagrams are dropped, not
+    fragmented - required to actually test jumbo frames end to end. Returns
+    True if it took effect. Platform-specific; best effort."""
+    try:
+        if sys.platform == "win32":
+            ip_dontfrag = getattr(socket, "IP_DONTFRAGMENT", 14)
+            sock.setsockopt(socket.IPPROTO_IP, ip_dontfrag, 1)
+        else:
+            ip_mtu_discover = getattr(socket, "IP_MTU_DISCOVER", 10)
+            pmtudisc_do = getattr(socket, "IP_PMTUDISC_DO", 2)
+            sock.setsockopt(socket.IPPROTO_IP, ip_mtu_discover, pmtudisc_do)
+        return True
+    except (OSError, AttributeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +205,11 @@ class StreamStats:
         self.cum_lost = 0
         self.cum_late = 0
 
+        # packet-size verification (jumbo-frame testing)
+        self.rx_echo_max = 0      # largest echo datagram received (return path)
+        self.peer_rx_max = 0      # largest size the far end reported receiving
+        self.size_mismatch = 0    # echoes whose length != the stamped size
+
     # -- producers (called from network threads) --------------------------
     def on_send(self, seq, send_ns):
         with self.lock:
@@ -183,12 +218,20 @@ class StreamStats:
             self.cum_tx += 1
             self._trim_locked()
 
-    def on_echo(self, seq, ts_ns, now_ns):
+    def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0):
         with self.lock:
             rtt = (now_ns - ts_ns) / 1e6
             if rtt < 0:
                 rtt = 0.0
             now_w = time.time()
+            # Size verification: rx_len = echo we got back (return path), peer_rx
+            # = bytes the reflector reported (forward path). psize = intended.
+            if rx_len > self.rx_echo_max:
+                self.rx_echo_max = rx_len
+            if peer_rx > self.peer_rx_max:
+                self.peer_rx_max = peer_rx
+            if psize and ((rx_len and rx_len != psize) or (peer_rx and peer_rx != psize)):
+                self.size_mismatch += 1
             p = self.pending.pop(seq, None)
             if p is not None:
                 # On-time echo.
@@ -294,6 +337,9 @@ class StreamStats:
                 "cum_recv": self.cum_recv,
                 "cum_lost": self.cum_lost,
                 "cum_late": self.cum_late,
+                "rx_echo_max": self.rx_echo_max,
+                "peer_rx_max": self.peer_rx_max,
+                "size_mismatch": self.size_mismatch,
             }
 
     def reset(self):
@@ -310,6 +356,7 @@ class StreamStats:
             self.last_echo_t = 0.0
             self.window_start = time.time()
             self.cum_tx = self.cum_recv = self.cum_lost = self.cum_late = 0
+            self.rx_echo_max = self.peer_rx_max = self.size_mismatch = 0
 
     def _trim_locked(self):
         horizon = time.time() - self.window
@@ -410,7 +457,7 @@ def score_color(r):
 # UDP stream: one bound socket per port, both originates and reflects.
 # ---------------------------------------------------------------------------
 class UDPStream:
-    def __init__(self, cfg, peer, bind, size, interval, stats, stop):
+    def __init__(self, cfg, peer, bind, size, interval, stats, stop, dont_fragment=False):
         self.sid, _, self.port, self.name = cfg
         self.peer = peer
         self.bind = bind
@@ -418,6 +465,7 @@ class UDPStream:
         self.interval = interval
         self.stats = stats
         self.stop = stop
+        self.dont_fragment = dont_fragment
         self.sock = None
         self.threads = []
 
@@ -425,6 +473,8 @@ class UDPStream:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         enlarge_socket_buffers(s)  # absorb Windows microbursts -> no phantom UDP loss
+        if self.dont_fragment:
+            set_dont_fragment(s)   # jumbo probes that don't fit are dropped, not split
         s.bind((self.bind, self.port))
         s.settimeout(0.5)
         self.sock = s
@@ -467,16 +517,19 @@ class UDPStream:
             parsed = parse_header(data)
             if parsed is None:
                 continue
-            ptype, sid, seq, ts_ns = parsed
+            ptype, sid, seq, ts_ns, psize, rxsize = parsed
             if ptype == TYPE_PROBE:
-                # Reflect straight back to the originator.
-                echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, len(data))
+                # Reflect back, stamping rxsize = bytes we actually received so
+                # the originator learns the size delivered to this end.
+                rxlen = len(data)
+                echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen, rxsize=rxlen)
                 try:
                     self.sock.sendto(echo, addr)
                 except OSError:
                     pass
             elif ptype == TYPE_ECHO:
-                self.stats.on_echo(seq, ts_ns, time.monotonic_ns())
+                self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
+                                   rx_len=len(data), psize=psize, peer_rx=rxsize)
 
 
 # ---------------------------------------------------------------------------
@@ -554,9 +607,10 @@ class TCPStream:
                 parsed = parse_header(msg)
                 if parsed is None:
                     continue
-                ptype, sid, seq, ts_ns = parsed
+                ptype, sid, seq, ts_ns, psize, rxsize = parsed
                 if ptype == TYPE_PROBE:
-                    echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, self.size)
+                    echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, self.size,
+                                        rxsize=len(msg))
                     try:
                         conn.sendall(echo)
                     except OSError:
@@ -629,9 +683,10 @@ class TCPStream:
             parsed = parse_header(msg)
             if parsed is None:
                 continue
-            ptype, sid, seq, ts_ns = parsed
+            ptype, sid, seq, ts_ns, psize, rxsize = parsed
             if ptype == TYPE_ECHO:
-                self.stats.on_echo(seq, ts_ns, time.monotonic_ns())
+                self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
+                                   rx_len=len(msg), psize=psize, peer_rx=rxsize)
 
 
 # ---------------------------------------------------------------------------
@@ -639,9 +694,11 @@ class TCPStream:
 # ---------------------------------------------------------------------------
 class Engine:
     def __init__(self, peer, bind, size, pps, window, timeout, history_seconds=300,
-                 loss_deadband=0.5):
+                 loss_deadband=0.5, dont_fragment=False):
         self.peer = peer
         self.bind = bind
+        self.size = size
+        self.dont_fragment = dont_fragment
         self.stop = threading.Event()
         self.start_time = time.time()
         self.history_seconds = history_seconds
@@ -657,7 +714,8 @@ class Engine:
             st = StreamStats(window=window, timeout=timeout, target_pps=pps)
             self.stats[sid] = st
             if proto == "UDP":
-                self.streams.append(UDPStream(cfg, peer, bind, size, interval, st, self.stop))
+                self.streams.append(UDPStream(cfg, peer, bind, size, interval, st,
+                                              self.stop, dont_fragment=dont_fragment))
             else:
                 self.streams.append(TCPStream(cfg, peer, bind, size, interval, st, self.stop))
 
@@ -747,6 +805,16 @@ class Engine:
             "loss_pct": (tot_lost / decided * 100.0) if decided else 0.0,
             "late_pct": (tot_late / decided * 100.0) if decided else 0.0,
         }
+        # Aggregate size verification across the UDP streams (the jumbo-relevant
+        # ones): "verified" once full-size datagrams have round-tripped both ways.
+        udp_rows = [r for r in rows if r["proto"] == "UDP" and r["connected"]]
+        if any(r["size_mismatch"] for r in rows):
+            size_status = "mismatch"
+        elif udp_rows and all(r["peer_rx_max"] >= self.size and r["rx_echo_max"] >= self.size
+                              for r in udp_rows):
+            size_status = "verified"
+        else:
+            size_status = "pending"
         return {
             "rows": rows,
             "overall": overall,
@@ -758,6 +826,9 @@ class Engine:
             "uptime": time.time() - self.start_time,
             "links_up": len(scores),
             "totals": totals,
+            "frame_size": self.size,
+            "dont_fragment": self.dont_fragment,
+            "size_status": size_status,
         }
 
     def reset(self):
@@ -1019,19 +1090,27 @@ def run_gui(engine, args):
              font=(FONT, 9)).pack(side="left")
 
     # ---- totals table (hidden by default; toggled by the Totals button) ----
-    totals_cols = ("stream", "sent", "recv", "lost", "late", "lossp")
+    totals_cols = ("stream", "sent", "recv", "lost", "late", "lossp",
+                   "txb", "peerrx", "echorx", "size")
     totals_head = {"stream": "Stream", "sent": "Sent", "recv": "Received",
-                   "lost": "Lost", "late": "Late", "lossp": "Loss %"}
+                   "lost": "Lost", "late": "Late", "lossp": "Loss %",
+                   "txb": "TX B", "peerrx": "Peer RX B", "echorx": "My RX B",
+                   "size": "Size"}
+    totals_w = {"stream": 110, "sent": 78, "recv": 84, "lost": 64, "late": 60,
+                "lossp": 64, "txb": 66, "peerrx": 78, "echorx": 72, "size": 80}
     totals_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
     totals_frame.pack(fill="x", side="bottom")
     totals_tree = ttk.Treeview(totals_frame, columns=totals_cols, show="headings",
                                height=len(STREAMS), style="NQ.Treeview")
     for c in totals_cols:
         totals_tree.heading(c, text=totals_head[c])
-        totals_tree.column(c, width=120, anchor=("w" if c == "stream" else "e"),
+        totals_tree.column(c, width=totals_w[c], anchor=("w" if c == "stream" else "e"),
                            stretch=(c == "stream"))
+    totals_tree.tag_configure("ok", foreground="#7ee2b8")
+    totals_tree.tag_configure("bad", foreground="#ffb3a6")
     for sid, proto, port, name in STREAMS:
-        totals_tree.insert("", "end", iid=f"t{sid}", values=(name, 0, 0, 0, 0, "0.0"))
+        totals_tree.insert("", "end", iid=f"t{sid}",
+                           values=(name, 0, 0, 0, 0, "0.0", 0, 0, 0, "-"))
     # not packed yet -> hidden until the Totals button is clicked
 
     # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
@@ -1077,8 +1156,12 @@ def run_gui(engine, args):
 
         up_s = int(snap["uptime"])
         t = snap["totals"]
+        df = "on" if snap["dont_fragment"] else "off"
+        size_tag = {"verified": "✓ verified", "mismatch": "⚠ MISMATCH",
+                    "pending": "…"}[snap["size_status"]]
         foot_var.set(
-            f"peer {args.peer}    {ports_summary()}    {args.pps} probes/s/stream    "
+            f"peer {args.peer}    {ports_summary()}    "
+            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}    "
             f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}"
             f"    |  since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
             f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  late {t['late']:,}")
@@ -1087,9 +1170,19 @@ def run_gui(engine, args):
             for row in snap["rows"]:
                 decided = row["cum_recv"] + row["cum_lost"] + row["cum_late"]
                 lossp = (row["cum_lost"] / decided * 100.0) if decided else 0.0
-                totals_tree.item(f"t{row['sid']}", values=(
+                full = (row["peer_rx_max"] >= snap["frame_size"]
+                        and row["rx_echo_max"] >= snap["frame_size"])
+                if row["size_mismatch"]:
+                    size_cell, tag = f"⚠ {row['size_mismatch']}", "bad"
+                elif full:
+                    size_cell, tag = "OK", "ok"
+                else:
+                    size_cell, tag = "…", ""
+                totals_tree.item(f"t{row['sid']}", tags=(tag,), values=(
                     row["name"], f"{row['cum_tx']:,}", f"{row['cum_recv']:,}",
-                    f"{row['cum_lost']:,}", f"{row['cum_late']:,}", f"{lossp:.2f}"))
+                    f"{row['cum_lost']:,}", f"{row['cum_late']:,}", f"{lossp:.2f}",
+                    snap["frame_size"], row["peer_rx_max"], row["rx_echo_max"],
+                    size_cell))
 
         hist = engine.history_copy()
         now = time.time()
@@ -1148,7 +1241,14 @@ def run_console(engine, args):
                           f"{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
             up = int(snap["uptime"])
             t = snap["totals"]
+            df = "on" if snap["dont_fragment"] else "off"
+            size_tag = {"verified": "verified", "mismatch": "MISMATCH",
+                        "pending": "pending"}[snap["size_status"]]
             print("  " + "-" * 100)
+            print(f"  frame {snap['frame_size']} B   DF {df}   size {size_tag}"
+                  f"   (UDP peer-RX / my-RX per stream:"
+                  + "".join(f"  {r['name'].split('-')[1]} {r['peer_rx_max']}/{r['rx_echo_max']}"
+                            for r in snap["rows"] if r["proto"] == "UDP") + ")")
             print(f"  totals since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
                   f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  late {t['late']:,} "
                   f"({t['late_pct']:.2f}%)")
@@ -1193,7 +1293,12 @@ def parse_args(argv=None):
     p.add_argument("--pps", type=int, default=50,
                    help="Probe packets per second, per stream (default 50).")
     p.add_argument("--size", type=int, default=200,
-                   help="Probe packet size in bytes (default 200, min %d)." % HEADER_LEN)
+                   help="Probe packet size in bytes (default 200, min %d, max %d; "
+                        "e.g. 8972 to fill a 9000-byte jumbo frame)."
+                        % (HEADER_LEN, MAX_SIZE))
+    p.add_argument("--dont-fragment", action="store_true",
+                   help="Set the IPv4 Don't-Fragment bit on UDP so oversized probes "
+                        "are dropped, not fragmented (required to truly test jumbo).")
     p.add_argument("--window", type=float, default=10.0,
                    help="Sliding window in seconds for loss/jitter/rates (default 10).")
     p.add_argument("--timeout", type=float, default=2.0,
@@ -1206,6 +1311,14 @@ def parse_args(argv=None):
                    help="UI refresh interval in ms (default 500).")
     p.add_argument("--no-gui", action="store_true",
                    help="Force the console UI even if a display is available.")
+    p.add_argument("--mtu-sweep", action="store_true",
+                   help="One-shot: binary-search the largest UDP payload that reaches "
+                        "the peer unfragmented (peer must be running Network Vitals), "
+                        "then exit. Honours --dont-fragment (implied on).")
+    p.add_argument("--sweep-min", type=int, default=1400,
+                   help="MTU sweep lower bound, UDP payload bytes (default 1400).")
+    p.add_argument("--sweep-max", type=int, default=9000,
+                   help="MTU sweep upper bound, UDP payload bytes (default 9000).")
     return p.parse_args(argv)
 
 
@@ -1235,10 +1348,88 @@ def clear_timer_resolution(period_ms):
         pass
 
 
+def run_mtu_sweep(args):
+    """Binary-search the largest UDP payload that reaches the peer unfragmented.
+
+    Sends probes with DF set to the peer's UDP reflector and watches for echoes.
+    Binds an ephemeral source port so it coexists with a normally-running
+    instance on either end. Measures the FORWARD path MTU (this host -> peer);
+    the return echo may fragment without affecting detection.
+    """
+    peer, port = args.peer, args.udp_ports[0]
+    lo = max(HEADER_LEN, min(args.sweep_min, MAX_SIZE))
+    hi = max(lo, min(args.sweep_max, MAX_SIZE))
+    print(f"MTU sweep -> {peer}:{port} (UDP, Don't-Fragment). "
+          f"Peer must be running Network Vitals.\n")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    enlarge_socket_buffers(sock)
+    if not set_dont_fragment(sock):
+        print("WARNING: could not set Don't-Fragment - results may reflect "
+              "fragmentation, not true path MTU.\n")
+    try:
+        sock.bind((args.bind, 0))  # ephemeral source port
+    except OSError as e:
+        print(f"bind failed: {e}")
+        return
+    sock.settimeout(0.4)
+    seq = [0]
+
+    def round_trips(size):
+        """True if a probe of `size` bytes gets an echo back (4 tries)."""
+        for _ in range(4):
+            seq[0] += 1
+            s = seq[0]
+            pkt = build_packet(TYPE_PROBE, 0, s, time.monotonic_ns(), size, rxsize=size)
+            try:
+                sock.sendto(pkt, (peer, port))
+            except OSError:
+                return False  # EMSGSIZE: exceeds the local NIC MTU
+            deadline = time.monotonic() + 0.4
+            while time.monotonic() < deadline:
+                try:
+                    data, _ = sock.recvfrom(MAX_SIZE)
+                except socket.timeout:
+                    break
+                except OSError:
+                    return False
+                p = parse_header(data)
+                if p and p[0] == TYPE_ECHO and p[2] == s:
+                    return True
+        return False
+
+    if not round_trips(lo):
+        print(f"  {lo} B payload did not round-trip - peer down, UDP {port} "
+              f"blocked, or even the base size is being dropped.")
+        sock.close()
+        return
+    print(f"  {lo:>5} B payload  ...  OK")
+    best, blo, bhi = lo, lo + 1, hi
+    while blo <= bhi:
+        mid = (blo + bhi) // 2
+        ok = round_trips(mid)
+        print(f"  {mid:>5} B payload  ...  {'OK' if ok else 'dropped'}")
+        if ok:
+            best, blo = mid, mid + 1
+        else:
+            bhi = mid - 1
+    sock.close()
+    frame = best + 28  # + 20 IPv4 + 8 UDP
+    print()
+    print(f"Largest UDP payload that traverses unfragmented:  {best} bytes")
+    print(f"Forward path MTU (this host -> peer):            ~{frame} bytes")
+    if frame >= 9000:
+        print("=> Jumbo frames (>=9000) confirmed end to end.  ✓")
+    elif frame > 1500:
+        print(f"=> Larger-than-standard frames supported up to ~{frame} B "
+              f"(but short of 9000 jumbo).")
+    else:
+        print("=> Standard 1500-byte MTU; no jumbo on this path.")
+
+
 def main(argv=None):
     args = parse_args(argv)
-    if args.size < HEADER_LEN:
-        args.size = HEADER_LEN
+    args.size = max(HEADER_LEN, min(args.size, MAX_SIZE))
     if args.pps < 1:
         args.pps = 1
 
@@ -1246,10 +1437,15 @@ def main(argv=None):
     global STREAMS
     STREAMS = build_streams(args.udp_ports, args.tcp_ports)
 
+    if args.mtu_sweep:
+        run_mtu_sweep(args)
+        return
+
     set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
     engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
                     args.timeout, history_seconds=args.history,
-                    loss_deadband=args.loss_deadband)
+                    loss_deadband=args.loss_deadband,
+                    dont_fragment=args.dont_fragment)
     engine.start()
 
     use_gui = not args.no_gui
