@@ -216,17 +216,39 @@ class StreamStats:
         self.peer_rx_max = 0      # largest size the far end reported receiving
         self.size_mismatch = 0    # echoes whose length != the stamped size
 
-        # loss localization: split round-trip loss into forward vs return.
-        self.refl_rx = 0          # probes we (as reflector) received from the peer
-        self.peer_refl = 0        # probes the peer received from us (max reported)
+        # Loss localization: the reflector detects forward loss as GAPS in the
+        # peer's sequence numbers (epoch-independent, immune to which app started
+        # first), and echoes the running gap count back. Forward = those gaps;
+        # return = round-trip lost - forward. seq is monotonic for UDP; for TCP
+        # it restarts each reconnect, which we detect as a large backward jump.
+        self.refl_rx = 0          # probes we received from the peer (reference)
+        self.refl_first = 0       # first peer seq seen this run (0 = unset)
+        self.refl_max = 0         # highest peer seq seen this run
+        self.refl_run = 0         # probes received in the current seq run
+        self.refl_gap = 0         # forward-loss gaps finalized from prior runs
+        self.peer_fwd = 0         # forward-loss count the peer reports (max seen)
 
     # -- producers (called from network threads) --------------------------
-    def on_probe_rx(self):
-        """Reflector side: count a probe received from the peer; return the new
-        cumulative total so it can be stamped into the echo."""
+    def on_probe_rx(self, seq):
+        """Reflector side: fold a received probe's seq into gap tracking and
+        return the cumulative forward-loss count to stamp into the echo."""
         with self.lock:
             self.refl_rx += 1
-            return self.refl_rx
+            if self.refl_first == 0:
+                self.refl_first = self.refl_max = seq
+                self.refl_run = 1
+            elif seq < self.refl_max - 100:
+                # large backward jump = seq reset (TCP reconnect): bank the
+                # current run's gaps and start a fresh run.
+                self.refl_gap += max(0, (self.refl_max - self.refl_first + 1) - self.refl_run)
+                self.refl_first = self.refl_max = seq
+                self.refl_run = 1
+            else:
+                if seq > self.refl_max:
+                    self.refl_max = seq
+                self.refl_run += 1
+            live_gap = max(0, (self.refl_max - self.refl_first + 1) - self.refl_run)
+            return self.refl_gap + live_gap
 
     def on_send(self, seq, send_ns):
         with self.lock:
@@ -235,7 +257,7 @@ class StreamStats:
             self.cum_tx += 1
             self._trim_locked()
 
-    def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0, peer_count=0):
+    def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0, peer_fwd=0):
         with self.lock:
             rtt = (now_ns - ts_ns) / 1e6
             if rtt < 0:
@@ -249,10 +271,10 @@ class StreamStats:
                 self.peer_rx_max = peer_rx
             if psize and ((rx_len and rx_len != psize) or (peer_rx and peer_rx != psize)):
                 self.size_mismatch += 1
-            # Loss localization: peer_count = how many of our probes the peer has
-            # received (monotonic; keep the max seen).
-            if peer_count > self.peer_refl:
-                self.peer_refl = peer_count
+            # Loss localization: peer_fwd = forward-loss gaps the peer has seen
+            # in our sequence (monotonic; keep the max seen).
+            if peer_fwd > self.peer_fwd:
+                self.peer_fwd = peer_fwd
             p = self.pending.pop(seq, None)
             if p is not None:
                 # On-time echo.
@@ -338,15 +360,14 @@ class StreamStats:
                 tput_ratio = 1.0
             conn_list = sorted(self.connect_samples)
             connect_ms = conn_list[len(conn_list) // 2] if conn_list else None
-            # Loss localization (cumulative since reset). peer_refl = probes the
-            # peer received from us. In-flight skew is a few packets and washes
-            # out over a long run.
-            #   forward loss  = we sent - peer received      (probes lost -> peer)
-            #   return  loss  = peer received - we got echoes(echoes lost -> us)
-            fwd_lost = max(0, self.cum_tx - self.peer_refl)
-            rtn_lost = max(0, self.peer_refl - self.cum_recv)
+            # Loss localization. The true round-trip loss (cum_lost) is split:
+            # forward = the gaps the peer's reflector saw in our sequence (probes
+            # that never reached it); return = whatever's left (echoes that never
+            # made it back). This always reconciles: forward + return = cum_lost.
+            fwd_lost = min(self.peer_fwd, self.cum_lost)
+            rtn_lost = max(0, self.cum_lost - fwd_lost)
             fwd_pct = (fwd_lost / self.cum_tx * 100.0) if self.cum_tx else 0.0
-            rtn_pct = (rtn_lost / self.peer_refl * 100.0) if self.peer_refl else 0.0
+            rtn_pct = (rtn_lost / self.cum_tx * 100.0) if self.cum_tx else 0.0
             return {
                 "connected": connected,
                 "rtt_avg": avg,
@@ -371,7 +392,7 @@ class StreamStats:
                 "peer_rx_max": self.peer_rx_max,
                 "size_mismatch": self.size_mismatch,
                 "refl_rx": self.refl_rx,
-                "peer_refl": self.peer_refl,
+                "peer_fwd": self.peer_fwd,
                 "fwd_lost": fwd_lost,
                 "rtn_lost": rtn_lost,
                 "fwd_pct": fwd_pct,
@@ -393,7 +414,8 @@ class StreamStats:
             self.window_start = time.time()
             self.cum_tx = self.cum_recv = self.cum_lost = self.cum_late = 0
             self.rx_echo_max = self.peer_rx_max = self.size_mismatch = 0
-            self.refl_rx = self.peer_refl = 0
+            self.refl_rx = self.peer_fwd = 0
+            self.refl_first = self.refl_max = self.refl_run = self.refl_gap = 0
 
     def _trim_locked(self):
         horizon = time.time() - self.window
@@ -581,9 +603,9 @@ class UDPStream:
                 # received so the originator can verify size and split loss by
                 # direction.
                 rxlen = len(data)
-                cnt = self.stats.on_probe_rx()
+                fwd = self.stats.on_probe_rx(seq)
                 echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
-                                    rxsize=rxlen, rxcount=cnt)
+                                    rxsize=rxlen, rxcount=fwd)
                 try:
                     self.sock.sendto(echo, addr)
                 except OSError:
@@ -591,7 +613,7 @@ class UDPStream:
             elif ptype == TYPE_ECHO:
                 self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
                                    rx_len=len(data), psize=psize, peer_rx=rxsize,
-                                   peer_count=rxcount)
+                                   peer_fwd=rxcount)
 
 
 # ---------------------------------------------------------------------------
@@ -671,9 +693,9 @@ class TCPStream:
                     continue
                 ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
                 if ptype == TYPE_PROBE:
-                    cnt = self.stats.on_probe_rx()
+                    fwd = self.stats.on_probe_rx(seq)
                     echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, self.size,
-                                        rxsize=len(msg), rxcount=cnt)
+                                        rxsize=len(msg), rxcount=fwd)
                     try:
                         conn.sendall(echo)
                     except OSError:
@@ -750,7 +772,7 @@ class TCPStream:
             if ptype == TYPE_ECHO:
                 self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
                                    rx_len=len(msg), psize=psize, peer_rx=rxsize,
-                                   peer_count=rxcount)
+                                   peer_fwd=rxcount)
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +848,7 @@ class Engine:
         proto_mos = {"UDP": [], "TCP": []}
         proto_score = {"UDP": [], "TCP": []}
         tot_tx = tot_recv = tot_lost = tot_late = 0
-        tot_fwd = tot_rtn = tot_peer_refl = 0
+        tot_fwd = tot_rtn = 0
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
             eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
@@ -850,7 +872,6 @@ class Engine:
             tot_late += snap["cum_late"]
             tot_fwd += snap["fwd_lost"]
             tot_rtn += snap["rtn_lost"]
-            tot_peer_refl += snap["peer_refl"]
             if snap["connected"] and snap["samples"] > 0:
                 scores.append(score)
                 if mos is not None:
@@ -874,7 +895,7 @@ class Engine:
             "late_pct": (tot_late / decided * 100.0) if decided else 0.0,
             "fwd_lost": tot_fwd, "rtn_lost": tot_rtn,
             "fwd_pct": (tot_fwd / tot_tx * 100.0) if tot_tx else 0.0,
-            "rtn_pct": (tot_rtn / tot_peer_refl * 100.0) if tot_peer_refl else 0.0,
+            "rtn_pct": (tot_rtn / tot_tx * 100.0) if tot_tx else 0.0,
         }
         # Aggregate size verification across the UDP streams (the jumbo-relevant
         # ones): "verified" once full-size datagrams have round-tripped both ways.
