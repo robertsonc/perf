@@ -52,6 +52,10 @@ plus, in the header:
 - a **Totals** button that toggles a per-stream lifetime table (sent / received
   / lost / late / loss %). Aggregate lifetime totals are always shown in the
   bottom status bar; both reset with **Reset / Clear**.
+- an **Isolate** button that splits each stream's round-trip loss into a
+  **forward** component (probes that never reached the peer) and a **return**
+  component (echoes that never made it back), and names the failing leg — see
+  *Locating loss* below.
 
 Charts keep a rolling history (default 5 minutes, `--history`). The window
 resizes freely; the charts grow and shrink with it.
@@ -201,6 +205,39 @@ Bad below.
 At the defaults each stream is ~50 packets/s × 200 B ≈ 10 KB/s each way, i.e.
 ~80 KB/s total for the box — light enough to leave running, dense enough to
 resolve loss and jitter well. Bump `--pps` / `--size` for a heavier load test.
+
+## Locating loss
+
+Round-trip loss alone can't tell you *where* a packet died. Each reflector
+counts the probes it receives per stream and stamps that cumulative count into
+every echo, so the originator can decompose its loss:
+
+- **Forward loss** = `probes I sent − probes the peer received` (dropped on the
+  way *to* the peer: my TX, the wire, or the peer's receive path).
+- **Return loss** = `probes the peer received − echoes I got back` (dropped on
+  the way *back*: the peer's TX, the wire, or my receive path).
+
+The bottom status bar always shows the aggregate `fwd→` / `rtn←` split, and the
+**Isolate** button opens a per-stream table with a **Where** verdict
+(`→ forward`, `← return`, `both dirs`, or `clean`).
+
+Because each host is symmetric, cross-referencing the two directions with each
+host's own drop counters pins the exact segment. Key move: a NIC/host that is
+dropping on **receive** (e.g. RX-ring overflow — Windows
+`Get-NetAdapterStatistics` → `ReceivedDiscardedPackets` climbing) shows up as
+**forward** loss on the *other* host's screen (its probes reached your wire but
+were dropped before your reflector counted them). So "forward loss to host B" +
+"B's `ReceivedDiscardedPackets` climbing in step" = B's receive ring, not the
+network. Typical fixes for RX-ring overflow: raise the adapter's *Receive
+Buffers*, and disable *RSC* / *Interrupt Moderation*.
+
+> A few packets of in-flight skew can land on *return* on a very fast path; it
+> washes out over a long run, and the per-stream verdict ignores single-digit
+> counts. Trust the split once counts are in the hundreds+.
+
+> **Version note:** the wire header changed to carry the reflector count, so
+> **both ends must run this version** — a mixed pair won't parse each other's
+> packets.
 
 ## Jumbo-frame testing
 
