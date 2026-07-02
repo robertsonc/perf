@@ -52,14 +52,19 @@ from collections import deque
 # the originator computes RTT = now - ts_ns purely against its OWN clock.
 
 MAGIC = 0x4E51_5631  # "NQV1"
-# magic(I) type(B) sid(B) seq(I) ts_ns(Q) psize(H) rxsize(H)
-#   psize  = the total size this packet is meant to be (self-describing; lets
-#            the receiver assert it got a full-size datagram - jumbo testing).
-#   rxsize = bytes the reflector actually received (0 in a probe; filled into the
-#            echo) so the originator learns the size delivered to the far end.
-HEADER = struct.Struct("!IBBIQHH")
-HEADER_LEN = HEADER.size  # 22 bytes
+# magic(I) type(B) sid(B) seq(I) ts_ns(Q) psize(H) rxsize(H) rxcount(I)
+#   psize   = the total size this packet is meant to be (self-describing; lets
+#             the receiver assert it got a full-size datagram - jumbo testing).
+#   rxsize  = bytes the reflector actually received (0 in a probe; filled into
+#             the echo) so the originator learns the delivered size.
+#   rxcount = the reflector's cumulative count of probes received on this stream
+#             (0 in a probe; filled into the echo) so the originator can split
+#             its round-trip loss into forward (probes that never reached the
+#             peer) vs return (echoes that never made it back) - loss isolation.
+HEADER = struct.Struct("!IBBIQHHI")
+HEADER_LEN = HEADER.size  # 26 bytes
 MAX_SIZE = 65535          # psize/rxsize are uint16
+MAX_COUNT = 0xFFFF_FFFF   # rxcount is uint32
 
 TYPE_PROBE = 1
 TYPE_ECHO = 2
@@ -99,29 +104,30 @@ def ports_summary():
     return f"UDP {udp}  TCP {tcp}"
 
 
-def build_packet(ptype, sid, seq, ts_ns, size, rxsize=0):
+def build_packet(ptype, sid, seq, ts_ns, size, rxsize=0, rxcount=0):
     """Build a fixed-size packet padded out to `size` bytes.
 
-    `size` is also stamped into the header (psize) so the receiver can confirm
-    it got a full-size datagram; `rxsize` is the size the reflector observed
-    (set only on echoes).
+    `size` is stamped into the header (psize) so the receiver can confirm it got
+    a full-size datagram; `rxsize`/`rxcount` are the size and cumulative probe
+    count the reflector observed (set only on echoes).
     """
     if size < HEADER_LEN:
         size = HEADER_LEN
     if size > MAX_SIZE:
         size = MAX_SIZE
-    hdr = HEADER.pack(MAGIC, ptype, sid, seq, ts_ns, size, min(rxsize, MAX_SIZE))
+    hdr = HEADER.pack(MAGIC, ptype, sid, seq, ts_ns, size,
+                      min(rxsize, MAX_SIZE), rxcount & MAX_COUNT)
     return hdr + b"\x00" * (size - HEADER_LEN)
 
 
 def parse_header(data):
-    """Return (ptype, sid, seq, ts_ns, psize, rxsize) or None if not our traffic."""
+    """Return (ptype, sid, seq, ts_ns, psize, rxsize, rxcount) or None."""
     if len(data) < HEADER_LEN:
         return None
-    magic, ptype, sid, seq, ts_ns, psize, rxsize = HEADER.unpack(data[:HEADER_LEN])
-    if magic != MAGIC:
+    fields = HEADER.unpack(data[:HEADER_LEN])
+    if fields[0] != MAGIC:
         return None
-    return ptype, sid, seq, ts_ns, psize, rxsize
+    return fields[1:]  # ptype, sid, seq, ts_ns, psize, rxsize, rxcount
 
 
 # Socket buffer size. Windows defaults to a small (~64 KB) UDP receive buffer.
@@ -210,7 +216,18 @@ class StreamStats:
         self.peer_rx_max = 0      # largest size the far end reported receiving
         self.size_mismatch = 0    # echoes whose length != the stamped size
 
+        # loss localization: split round-trip loss into forward vs return.
+        self.refl_rx = 0          # probes we (as reflector) received from the peer
+        self.peer_refl = 0        # probes the peer received from us (max reported)
+
     # -- producers (called from network threads) --------------------------
+    def on_probe_rx(self):
+        """Reflector side: count a probe received from the peer; return the new
+        cumulative total so it can be stamped into the echo."""
+        with self.lock:
+            self.refl_rx += 1
+            return self.refl_rx
+
     def on_send(self, seq, send_ns):
         with self.lock:
             self.pending[seq] = (time.time(), send_ns)
@@ -218,7 +235,7 @@ class StreamStats:
             self.cum_tx += 1
             self._trim_locked()
 
-    def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0):
+    def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0, peer_count=0):
         with self.lock:
             rtt = (now_ns - ts_ns) / 1e6
             if rtt < 0:
@@ -232,6 +249,10 @@ class StreamStats:
                 self.peer_rx_max = peer_rx
             if psize and ((rx_len and rx_len != psize) or (peer_rx and peer_rx != psize)):
                 self.size_mismatch += 1
+            # Loss localization: peer_count = how many of our probes the peer has
+            # received (monotonic; keep the max seen).
+            if peer_count > self.peer_refl:
+                self.peer_refl = peer_count
             p = self.pending.pop(seq, None)
             if p is not None:
                 # On-time echo.
@@ -317,6 +338,15 @@ class StreamStats:
                 tput_ratio = 1.0
             conn_list = sorted(self.connect_samples)
             connect_ms = conn_list[len(conn_list) // 2] if conn_list else None
+            # Loss localization (cumulative since reset). peer_refl = probes the
+            # peer received from us. In-flight skew is a few packets and washes
+            # out over a long run.
+            #   forward loss  = we sent - peer received      (probes lost -> peer)
+            #   return  loss  = peer received - we got echoes(echoes lost -> us)
+            fwd_lost = max(0, self.cum_tx - self.peer_refl)
+            rtn_lost = max(0, self.peer_refl - self.cum_recv)
+            fwd_pct = (fwd_lost / self.cum_tx * 100.0) if self.cum_tx else 0.0
+            rtn_pct = (rtn_lost / self.peer_refl * 100.0) if self.peer_refl else 0.0
             return {
                 "connected": connected,
                 "rtt_avg": avg,
@@ -340,6 +370,12 @@ class StreamStats:
                 "rx_echo_max": self.rx_echo_max,
                 "peer_rx_max": self.peer_rx_max,
                 "size_mismatch": self.size_mismatch,
+                "refl_rx": self.refl_rx,
+                "peer_refl": self.peer_refl,
+                "fwd_lost": fwd_lost,
+                "rtn_lost": rtn_lost,
+                "fwd_pct": fwd_pct,
+                "rtn_pct": rtn_pct,
             }
 
     def reset(self):
@@ -357,6 +393,7 @@ class StreamStats:
             self.window_start = time.time()
             self.cum_tx = self.cum_recv = self.cum_lost = self.cum_late = 0
             self.rx_echo_max = self.peer_rx_max = self.size_mismatch = 0
+            self.refl_rx = self.peer_refl = 0
 
     def _trim_locked(self):
         horizon = time.time() - self.window
@@ -441,6 +478,27 @@ def score_label(r):
     return "Bad"
 
 
+def loss_verdict(fwd_lost, rtn_lost, inflight=6):
+    """Classify where a stream's loss is, from the forward/return split.
+
+    `inflight` is a small allowance for packets legitimately in flight (a few
+    per stream); over a long run real loss dwarfs it.
+    """
+    f = fwd_lost if fwd_lost > inflight else 0
+    r = rtn_lost if rtn_lost > inflight else 0
+    if f == 0 and r == 0:
+        return "clean", "ok"
+    if f and r > 3 * max(1, f):
+        return "← return", "warn"
+    if r and f > 3 * max(1, r):
+        return "→ forward", "warn"
+    if f and not r:
+        return "→ forward", "warn"
+    if r and not f:
+        return "← return", "warn"
+    return "both dirs", "warn"
+
+
 def score_color(r):
     if r >= 80:
         return "#1a9850"
@@ -517,19 +575,23 @@ class UDPStream:
             parsed = parse_header(data)
             if parsed is None:
                 continue
-            ptype, sid, seq, ts_ns, psize, rxsize = parsed
+            ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
             if ptype == TYPE_PROBE:
-                # Reflect back, stamping rxsize = bytes we actually received so
-                # the originator learns the size delivered to this end.
+                # Reflect back, stamping the bytes and cumulative probe count we
+                # received so the originator can verify size and split loss by
+                # direction.
                 rxlen = len(data)
-                echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen, rxsize=rxlen)
+                cnt = self.stats.on_probe_rx()
+                echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
+                                    rxsize=rxlen, rxcount=cnt)
                 try:
                     self.sock.sendto(echo, addr)
                 except OSError:
                     pass
             elif ptype == TYPE_ECHO:
                 self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
-                                   rx_len=len(data), psize=psize, peer_rx=rxsize)
+                                   rx_len=len(data), psize=psize, peer_rx=rxsize,
+                                   peer_count=rxcount)
 
 
 # ---------------------------------------------------------------------------
@@ -607,10 +669,11 @@ class TCPStream:
                 parsed = parse_header(msg)
                 if parsed is None:
                     continue
-                ptype, sid, seq, ts_ns, psize, rxsize = parsed
+                ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
                 if ptype == TYPE_PROBE:
+                    cnt = self.stats.on_probe_rx()
                     echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, self.size,
-                                        rxsize=len(msg))
+                                        rxsize=len(msg), rxcount=cnt)
                     try:
                         conn.sendall(echo)
                     except OSError:
@@ -683,10 +746,11 @@ class TCPStream:
             parsed = parse_header(msg)
             if parsed is None:
                 continue
-            ptype, sid, seq, ts_ns, psize, rxsize = parsed
+            ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
             if ptype == TYPE_ECHO:
                 self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
-                                   rx_len=len(msg), psize=psize, peer_rx=rxsize)
+                                   rx_len=len(msg), psize=psize, peer_rx=rxsize,
+                                   peer_count=rxcount)
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +826,7 @@ class Engine:
         proto_mos = {"UDP": [], "TCP": []}
         proto_score = {"UDP": [], "TCP": []}
         tot_tx = tot_recv = tot_lost = tot_late = 0
+        tot_fwd = tot_rtn = tot_peer_refl = 0
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
             eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
@@ -783,6 +848,9 @@ class Engine:
             tot_recv += snap["cum_recv"]
             tot_lost += snap["cum_lost"]
             tot_late += snap["cum_late"]
+            tot_fwd += snap["fwd_lost"]
+            tot_rtn += snap["rtn_lost"]
+            tot_peer_refl += snap["peer_refl"]
             if snap["connected"] and snap["samples"] > 0:
                 scores.append(score)
                 if mos is not None:
@@ -804,6 +872,9 @@ class Engine:
             "tx": tot_tx, "recv": tot_recv, "lost": tot_lost, "late": tot_late,
             "loss_pct": (tot_lost / decided * 100.0) if decided else 0.0,
             "late_pct": (tot_late / decided * 100.0) if decided else 0.0,
+            "fwd_lost": tot_fwd, "rtn_lost": tot_rtn,
+            "fwd_pct": (tot_fwd / tot_tx * 100.0) if tot_tx else 0.0,
+            "rtn_pct": (tot_rtn / tot_peer_refl * 100.0) if tot_peer_refl else 0.0,
         }
         # Aggregate size verification across the UDP streams (the jumbo-relevant
         # ones): "verified" once full-size datagrams have round-tripped both ways.
@@ -1042,7 +1113,25 @@ def run_gui(engine, args):
                            activeforeground="white", relief="flat", bd=0,
                            highlightthickness=0, padx=12, pady=5,
                            font=(FONT, 9, "bold"), cursor="hand2")
-    totals_btn.pack(side="left")
+    totals_btn.pack(side="left", padx=(0, 6))
+
+    isolate_shown = {"on": False}
+
+    def do_toggle_isolate():
+        isolate_shown["on"] = not isolate_shown["on"]
+        if isolate_shown["on"]:
+            iso_tree.pack(fill="x")
+            isolate_btn.configure(text="▴  Isolate")
+        else:
+            iso_tree.pack_forget()
+            isolate_btn.configure(text="⇄  Isolate")
+
+    isolate_btn = tk.Button(header, text="⇄  Isolate", command=do_toggle_isolate,
+                            bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                            activeforeground="white", relief="flat", bd=0,
+                            highlightthickness=0, padx=12, pady=5,
+                            font=(FONT, 9, "bold"), cursor="hand2")
+    isolate_btn.pack(side="left")
 
     # right-hand stat cluster: quality text + experience score + composite MOS
     stats = tk.Frame(header, bg=BG)
@@ -1113,6 +1202,28 @@ def run_gui(engine, args):
                            values=(name, 0, 0, 0, 0, "0.0", 0, 0, 0, "-"))
     # not packed yet -> hidden until the Totals button is clicked
 
+    # ---- isolate table (hidden; splits loss into forward vs return) --------
+    iso_cols = ("stream", "sent", "fwd", "fwdp", "rtn", "rtnp", "where")
+    iso_head = {"stream": "Stream", "sent": "Sent",
+                "fwd": "Fwd lost (→peer)", "fwdp": "Fwd %",
+                "rtn": "Rtn lost (←peer)", "rtnp": "Rtn %", "where": "Where"}
+    iso_w = {"stream": 110, "sent": 84, "fwd": 120, "fwdp": 70,
+             "rtn": 120, "rtnp": 70, "where": 110}
+    iso_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
+    iso_frame.pack(fill="x", side="bottom")
+    iso_tree = ttk.Treeview(iso_frame, columns=iso_cols, show="headings",
+                            height=len(STREAMS), style="NQ.Treeview")
+    for c in iso_cols:
+        iso_tree.heading(c, text=iso_head[c])
+        iso_tree.column(c, width=iso_w[c], anchor=("w" if c in ("stream", "where") else "e"),
+                        stretch=(c == "stream"))
+    iso_tree.tag_configure("ok", foreground="#7ee2b8")
+    iso_tree.tag_configure("warn", foreground="#ffd27e")
+    for sid, proto, port, name in STREAMS:
+        iso_tree.insert("", "end", iid=f"i{sid}",
+                        values=(name, 0, 0, "0.00", 0, "0.00", "…"))
+    # not packed yet -> hidden until the Isolate button is clicked
+
     # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
     charts = tk.Frame(root, bg=BG, padx=12, pady=6)
     charts.pack(fill="both", expand=True)
@@ -1164,7 +1275,17 @@ def run_gui(engine, args):
             f"frame {snap['frame_size']} B  DF {df}  size {size_tag}    "
             f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}"
             f"    |  since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
-            f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  late {t['late']:,}")
+            f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  "
+            f"[fwd→ {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)  "
+            f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)]")
+
+        if isolate_shown["on"]:
+            for row in snap["rows"]:
+                where, tag = loss_verdict(row["fwd_lost"], row["rtn_lost"])
+                iso_tree.item(f"i{row['sid']}", tags=(tag,), values=(
+                    row["name"], f"{row['cum_tx']:,}",
+                    f"{row['fwd_lost']:,}", f"{row['fwd_pct']:.2f}",
+                    f"{row['rtn_lost']:,}", f"{row['rtn_pct']:.2f}", where))
 
         if totals_shown["on"]:
             for row in snap["rows"]:
@@ -1252,6 +1373,10 @@ def run_console(engine, args):
             print(f"  totals since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
                   f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  late {t['late']:,} "
                   f"({t['late_pct']:.2f}%)")
+            print(f"  loss split:  forward -> {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)   "
+                  f"return <- {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)"
+                  + "".join(f"   {r['name'].split('-')[1]}:{loss_verdict(r['fwd_lost'], r['rtn_lost'])[0]}"
+                            for r in snap["rows"] if r["fwd_lost"] > 6 or r["rtn_lost"] > 6))
             print(f"  uptime {up//3600:02d}:{(up%3600)//60:02d}:{up%60:02d}")
             time.sleep(args.refresh_ms / 1000.0)
     except KeyboardInterrupt:
