@@ -209,13 +209,18 @@ resolve loss and jitter well. Bump `--pps` / `--size` for a heavier load test.
 ## Locating loss
 
 Round-trip loss alone can't tell you *where* a packet died. Each reflector
-counts the probes it receives per stream and stamps that cumulative count into
-every echo, so the originator can decompose its loss:
+watches the **gaps in the peer's sequence numbers** (probes that never arrived)
+and echoes the running gap count back, so the originator can decompose its
+measured round-trip loss:
 
-- **Forward loss** = `probes I sent − probes the peer received` (dropped on the
-  way *to* the peer: my TX, the wire, or the peer's receive path).
-- **Return loss** = `probes the peer received − echoes I got back` (dropped on
-  the way *back*: the peer's TX, the wire, or my receive path).
+- **Forward loss** = the sequence gaps the peer saw (dropped on the way *to* the
+  peer: my TX, the wire, or the peer's receive path).
+- **Return loss** = round-trip loss − forward loss (dropped on the way *back*:
+  the peer's TX, the wire, or my receive path).
+
+Counting gaps in *the originator's own sequence space* makes this immune to
+which app started first, and it always reconciles: **forward + return = the true
+round-trip loss**.
 
 The bottom status bar always shows the aggregate `fwd→` / `rtn←` split, and the
 **Isolate** button opens a per-stream table with a **Where** verdict
