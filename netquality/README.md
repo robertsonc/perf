@@ -79,6 +79,10 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
 - **Restart-proof loss isolation.** The forward/return loss split survives
   peer restarts, the Reset button, and deep packet reordering; the peer's
   lifetime counters are re-baselined automatically.
+- **Fit charts button.** If the charts ever end up mis-sized, ⤢ Fit charts
+  collapses the Totals/Isolate tables and re-fits the charts to the current
+  window. (The underlying layout bug — charts staying tiny after closing
+  Totals — is also fixed.)
 - **Single instance per port.** On Windows a second accidentally-launched
   instance now fails to bind instead of silently splitting packets with the
   first one (which used to read as huge random loss on both).
@@ -90,6 +94,22 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
   Python installer for Windows.
 - No clock synchronization between the two machines is required (latency is
   measured by round-trip, so both clocks are irrelevant).
+
+## Updating
+
+The app can update itself from the [netvitals repo](https://github.com/robertsonc/netvitals):
+
+```
+update.bat                      REM or: python netquality.py --update
+python netquality.py --check-update   REM report only (exit code 3 = update available)
+```
+
+`--update` downloads the latest `netquality.py`, sanity-checks it (compiles,
+recognisably this app, higher `__version__`), keeps the previous copy as
+`netquality.py.bak`, and swaps the file atomically. Restart to run the new
+version. A packaged `.exe` can't replace itself — rebuild with
+`build_exe.bat` after updating the source. Updates are only ever fetched when
+explicitly requested; the app never phones home on its own.
 
 ## Running it
 
