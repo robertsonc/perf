@@ -3,6 +3,9 @@
 #
 # Run from anywhere inside the perf repo, with git credentials that can push
 # to netvitals:   bash scripts/publish_netvitals.sh
+# (On Windows, run it from Git Bash.) Pushes over HTTPS using your normal
+# GitHub login/credential helper; set NETVITALS_URL to the SSH URL
+# (git@github.com:robertsonc/netvitals.git) if you prefer SSH keys.
 #
 # Copies netquality/ (app, bats, assets, README) into a fresh clone of the
 # netvitals repo and pushes to main. Idempotent: re-run any time netquality/
@@ -10,7 +13,7 @@
 # from the raw URL immediately.
 set -euo pipefail
 
-REPO_URL="${NETVITALS_URL:-git@github.com:robertsonc/netvitals.git}"
+REPO_URL="${NETVITALS_URL:-https://github.com/robertsonc/netvitals.git}"
 SRC="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)/netquality"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
