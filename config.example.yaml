@@ -25,7 +25,9 @@ iperf3:
 
   # window_kib: 4096            # iperf3 -w (TCP only)
   # mss_bytes: 1400             # iperf3 -M (TCP only)
-  # udp_bandwidth: "950M"       # iperf3 -b (UDP only, 0 = unlimited)
+  # udp_bandwidth: "950M"       # iperf3 -b. REQUIRED for protocol: udp.
+  #                             # "0" = unlimited (floods the path; only use
+  #                             # deliberately on an isolated bench).
   # udp_length: 1400            # iperf3 -l (UDP only)
 
 poller_interval_s: 1.0
@@ -45,6 +47,11 @@ hosts:
     ssh_user: "aruba"
     ssh_key_path: "~/.ssh/id_ed25519"
     # ssh_password_env: "SDWAN_SERVER_PASSWORD"
+    # Host keys are verified against ~/.ssh/known_hosts (populated by
+    # setup_ssh.py). Override with ssh_known_hosts, or — for an ISOLATED
+    # lab bench only — disable verification entirely:
+    # ssh_known_hosts: "~/.ssh/known_hosts"
+    # ssh_insecure_no_host_check: false
     iperf3_path: "iperf3"
 
   frr:

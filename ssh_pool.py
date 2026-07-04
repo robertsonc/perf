@@ -11,6 +11,7 @@ import logging
 import shlex
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 import asyncssh
 
@@ -23,11 +24,30 @@ class SshError(RuntimeError):
     """Raised when an SSH command fails."""
 
 
+def _self_excluding_pattern(pattern: str) -> str:
+    """Turn a pgrep/pkill -f pattern into one that cannot match the remote
+    shell that is running the pgrep/pkill itself (`sh -c 'pgrep -f ...'` has
+    the pattern in its own cmdline): bracket the first character."""
+    return f"[{pattern[0]}]{pattern[1:]}"
+
+
 @dataclass(slots=True)
 class _Conn:
     host: HostConfig
     name: str
     client: asyncssh.SSHClientConnection | None = None
+
+    def _known_hosts(self) -> str | None:
+        """Host-key verification source. Verification is ON by default,
+        against the same known_hosts file that setup_ssh.py populates."""
+        if self.host.ssh_insecure_no_host_check:
+            log.warning(
+                "%s: SSH host-key verification DISABLED by config "
+                "(ssh_insecure_no_host_check) — do not use on shared networks",
+                self.name,
+            )
+            return None
+        return str(Path(self.host.ssh_known_hosts).expanduser())
 
     async def connect(self) -> None:
         if self.client is not None:
@@ -36,7 +56,7 @@ class _Conn:
         connect_kwargs: dict = {
             "host": self.host.mgmt_ip,
             "username": self.host.ssh_user,
-            "known_hosts": None,  # lab-only; replace with strict known_hosts in prod
+            "known_hosts": self._known_hosts(),
             "keepalive_interval": 15,
             "keepalive_count_max": 3,
         }
@@ -52,6 +72,13 @@ class _Conn:
             self.client = await asyncio.wait_for(
                 asyncssh.connect(**connect_kwargs), timeout=15.0
             )
+        except asyncssh.HostKeyNotVerifiable as exc:
+            raise SshError(
+                f"Failed to connect to {self.name} ({self.host.mgmt_ip}): {exc}. "
+                f"The host key is not in {self.host.ssh_known_hosts} — run "
+                f"'python3 setup_ssh.py' once to record it, or set "
+                f"ssh_insecure_no_host_check: true for an isolated lab bench."
+            ) from exc
         except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
             raise SshError(
                 f"Failed to connect to {self.name} ({self.host.mgmt_ip}): {exc}"
@@ -59,9 +86,17 @@ class _Conn:
 
     async def close(self) -> None:
         if self.client is not None:
-            self.client.close()
-            await self.client.wait_closed()
+            client, self.client = self.client, None
+            client.close()
+            await client.wait_closed()
+
+    async def reconnect(self) -> None:
+        """Tear down and re-establish the connection (poller recovery path)."""
+        try:
+            await self.close()
+        except Exception:  # noqa: BLE001
             self.client = None
+        await self.connect()
 
     async def run(
         self, cmd: str, *, timeout: float = 30.0, check: bool = True,
@@ -75,6 +110,12 @@ class _Conn:
         except asyncio.TimeoutError as exc:
             raise SshError(
                 f"{self.name}: command timed out after {timeout}s: {cmd!r}"
+            ) from exc
+        except (asyncssh.Error, OSError) as exc:
+            # A dead/dropped connection must surface as SshError — callers
+            # (shutdown paths especially) are written against that contract.
+            raise SshError(
+                f"{self.name}: command failed ({exc}): {cmd!r}"
             ) from exc
         if check and result.exit_status != 0:
             raise SshError(
@@ -141,6 +182,7 @@ class ServerSession:
     def __init__(self, conn: _Conn, iperf3_path: str = "iperf3") -> None:
         self._conn = conn
         self._iperf3 = iperf3_path
+        self._ensured_port: int | None = None
 
     async def read_proc_net_dev(self) -> str:
         return await self._conn.read_proc_net_dev()
@@ -156,8 +198,12 @@ class ServerSession:
         """
         log.info("Ensuring iperf3 server on %s:%d", self._conn.host.mgmt_ip, port)
         iperf3 = shlex.quote(self._iperf3)
+        # Kill only OUR server instance pattern (this iperf3 binary, server
+        # mode, this port). A bare 'pkill -f iperf3' also killed other users'
+        # tests and any concurrent orchestrator's server on another port.
+        pattern = _self_excluding_pattern(f"{self._iperf3} -s -p {port}")
         await self._conn.run(
-            f"pkill -f {iperf3} || true",
+            f"pkill -f {shlex.quote(pattern)} || true",
             timeout=5.0, check=False,
         )
         await asyncio.sleep(0.5)
@@ -167,11 +213,14 @@ class ServerSession:
         )
         await self._conn.run(cmd, timeout=10.0)
         await asyncio.sleep(0.5)
+        # The bracketed pattern can't match the pgrep shell itself, so a '0'
+        # here genuinely means the daemon died (e.g. unwritable logfile).
         check = await self._conn.run(
-            f"pgrep -f {shlex.quote(f'{self._iperf3} -s -p {port}')} | wc -l",
+            f"pgrep -f {shlex.quote(pattern)} | wc -l",
             timeout=5.0, check=False,
         )
         running = (check.stdout or "0").strip()
+        self._ensured_port = port
         if running == "0":
             tail = await self._conn.run(
                 f"tail -20 /tmp/iperf3_{port}.log",
@@ -220,10 +269,15 @@ class ServerSession:
                 pass
 
     async def stop_iperf3_server(self) -> None:
-        log.info("Stopping iperf3 server")
+        if self._ensured_port is None:
+            return  # we never started one; nothing of ours to stop
+        log.info("Stopping iperf3 server (port %d)", self._ensured_port)
+        pattern = _self_excluding_pattern(
+            f"{self._iperf3} -s -p {self._ensured_port}"
+        )
         try:
             await self._conn.run(
-                f"pkill -f {shlex.quote(self._iperf3)} || true",
+                f"pkill -f {shlex.quote(pattern)} || true",
                 timeout=5.0, check=False,
             )
         except SshError as exc:
@@ -245,12 +299,24 @@ class SshPool:
 
     async def __aenter__(self) -> "SshPool":
         await self._frr_conn.connect()
-        await self._server_conn.connect()
+        try:
+            await self._server_conn.connect()
+        except BaseException:
+            # __aexit__ never runs when __aenter__ raises: close what we
+            # opened instead of abandoning a live connection with keepalives.
+            await self._frr_conn.close()
+            raise
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
         await self._server_conn.close()
         await self._frr_conn.close()
+
+    async def reconnect_frr(self) -> None:
+        await self._frr_conn.reconnect()
+
+    async def reconnect_server(self) -> None:
+        await self._server_conn.reconnect()
 
     async def preflight(self) -> None:
         """Cheap sanity checks: both hosts respond, /proc/net/dev readable."""

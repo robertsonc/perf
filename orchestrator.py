@@ -154,6 +154,7 @@ async def _run(config: Config) -> int:
             interfaces=config.frr_wan_interfaces(),
             interval=config.poller_interval_s,
             buffer_size=config.poller_buffer_size,
+            recover=pool.reconnect_frr,
         )
         server_poller = WirePoller(
             name="server",
@@ -161,6 +162,7 @@ async def _run(config: Config) -> int:
             interfaces=[server_iface],
             interval=config.poller_interval_s,
             buffer_size=config.poller_buffer_size,
+            recover=pool.reconnect_server,
         )
         await client_poller.start()
         await frr_poller.start()
