@@ -30,6 +30,7 @@ Local loopback smoke test (one machine, Linux only - two loopback aliases):
 import argparse
 import math
 import os
+import re
 import socket
 import struct
 import sys
@@ -37,6 +38,13 @@ import threading
 import time
 import traceback
 from collections import deque
+
+__version__ = "1.1.0"
+
+# Where --update / --check-update look for the latest release of this file.
+# Override with --update-url (or keep a fork's URL here).
+UPDATE_URL = ("https://raw.githubusercontent.com/robertsonc/netvitals/"
+              "main/netquality.py")
 
 # ---------------------------------------------------------------------------
 # Wire protocol
@@ -1283,7 +1291,7 @@ def run_gui(engine, args):
               for sid, proto, port, name in STREAMS]
 
     root = tk.Tk()
-    root.title(f"Network Vitals  -  peer {args.peer}")
+    root.title(f"Network Vitals {__version__}  -  peer {args.peer}")
     root.geometry("1000x600")
     root.minsize(480, 320)
     root.configure(bg=BG)
@@ -1327,12 +1335,15 @@ def run_gui(engine, args):
     totals_shown = {"on": False}
 
     def do_toggle_totals():
+        # Toggle the whole FRAME, not the tree inside it: an emptied,
+        # still-packed frame keeps its last requested size, which is what
+        # used to leave the bottom charts squeezed after closing the table.
         totals_shown["on"] = not totals_shown["on"]
         if totals_shown["on"]:
-            totals_tree.pack(fill="x")
+            totals_frame.pack(fill="x", side="bottom", before=charts)
             totals_btn.configure(text="▴  Totals")
         else:
-            totals_tree.pack_forget()
+            totals_frame.pack_forget()
             totals_btn.configure(text="▾  Totals")
 
     totals_btn = tk.Button(header, text="▾  Totals", command=do_toggle_totals,
@@ -1347,10 +1358,10 @@ def run_gui(engine, args):
     def do_toggle_isolate():
         isolate_shown["on"] = not isolate_shown["on"]
         if isolate_shown["on"]:
-            iso_tree.pack(fill="x")
+            iso_frame.pack(fill="x", side="bottom", before=charts)
             isolate_btn.configure(text="▴  Isolate")
         else:
-            iso_tree.pack_forget()
+            iso_frame.pack_forget()
             isolate_btn.configure(text="⇄  Isolate")
 
     isolate_btn = tk.Button(header, text="⇄  Isolate", command=do_toggle_isolate,
@@ -1358,7 +1369,25 @@ def run_gui(engine, args):
                             activeforeground="white", relief="flat", bd=0,
                             highlightthickness=0, padx=12, pady=5,
                             font=(FONT, 9, "bold"), cursor="hand2")
-    isolate_btn.pack(side="left")
+    isolate_btn.pack(side="left", padx=(0, 6))
+
+    def do_fit_charts():
+        """Collapse the bottom tables and force a fresh geometry pass so the
+        charts reclaim the full current window space."""
+        if totals_shown["on"]:
+            do_toggle_totals()
+        if isolate_shown["on"]:
+            do_toggle_isolate()
+        for c in (lat_canvas, loss_canvas, jit_canvas):
+            c.configure(width=100, height=80)
+        root.update_idletasks()
+
+    fit_btn = tk.Button(header, text="⤢  Fit charts", command=do_fit_charts,
+                        bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                        activeforeground="white", relief="flat", bd=0,
+                        highlightthickness=0, padx=12, pady=5,
+                        font=(FONT, 9, "bold"), cursor="hand2")
+    fit_btn.pack(side="left")
 
     # right-hand stat cluster: quality text + experience score + composite MOS
     stats = tk.Frame(header, bg=BG)
@@ -1415,9 +1444,10 @@ def run_gui(engine, args):
     totals_w = {"stream": 110, "sent": 78, "recv": 84, "lost": 64, "late": 60,
                 "lossp": 64, "txb": 66, "peerrx": 78, "echorx": 72, "size": 80}
     totals_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    totals_frame.pack(fill="x", side="bottom")
+    # not packed here — do_toggle_totals packs/unpacks the whole frame
     totals_tree = ttk.Treeview(totals_frame, columns=totals_cols, show="headings",
                                height=len(STREAMS), style="NQ.Treeview")
+    totals_tree.pack(fill="x")
     for c in totals_cols:
         totals_tree.heading(c, text=totals_head[c])
         totals_tree.column(c, width=totals_w[c], anchor=("w" if c == "stream" else "e"),
@@ -1427,7 +1457,7 @@ def run_gui(engine, args):
     for sid, proto, port, name in STREAMS:
         totals_tree.insert("", "end", iid=f"t{sid}",
                            values=(name, 0, 0, 0, 0, "0.0", 0, 0, 0, "-"))
-    # not packed yet -> hidden until the Totals button is clicked
+    # frame stays unpacked -> hidden until the Totals button is clicked
 
     # ---- isolate table (hidden; splits loss into forward vs return) --------
     iso_cols = ("stream", "sent", "fwd", "fwdp", "rtn", "rtnp", "where")
@@ -1437,9 +1467,10 @@ def run_gui(engine, args):
     iso_w = {"stream": 110, "sent": 84, "fwd": 120, "fwdp": 70,
              "rtn": 120, "rtnp": 70, "where": 110}
     iso_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    iso_frame.pack(fill="x", side="bottom")
+    # not packed here — do_toggle_isolate packs/unpacks the whole frame
     iso_tree = ttk.Treeview(iso_frame, columns=iso_cols, show="headings",
                             height=len(STREAMS), style="NQ.Treeview")
+    iso_tree.pack(fill="x")
     for c in iso_cols:
         iso_tree.heading(c, text=iso_head[c])
         iso_tree.column(c, width=iso_w[c], anchor=("w" if c in ("stream", "where") else "e"),
@@ -1449,19 +1480,36 @@ def run_gui(engine, args):
     for sid, proto, port, name in STREAMS:
         iso_tree.insert("", "end", iid=f"i{sid}",
                         values=(name, 0, 0, "0.00", 0, "0.00", "…"))
-    # not packed yet -> hidden until the Isolate button is clicked
+    # frame stays unpacked -> hidden until the Isolate button is clicked
 
     # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
+    # Laid out with grid + row weights, NOT pack: pack hands the space freed
+    # by a collapsing sibling (the Totals/Isolate tables) to the first
+    # expandable widget only, so after opening and closing Totals the bottom
+    # chart row stayed squeezed to a sliver until the app was restarted.
+    # Grid weights re-distribute the space proportionally on every geometry
+    # pass, so the charts always track the current window size.
     charts = tk.Frame(root, bg=BG, padx=12, pady=6)
     charts.pack(fill="both", expand=True)
-    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0)
-    lat_canvas.pack(fill="both", expand=True, pady=(0, 6))
+    charts.columnconfigure(0, weight=1)
+    charts.rowconfigure(0, weight=3, uniform="charts")
+    charts.rowconfigure(1, weight=2, uniform="charts")
+    # Small requested sizes: the drawn size is allocation-driven, and modest
+    # requests keep the layout solvable at any window size.
+    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0,
+                           width=100, height=80)
+    lat_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
     bottom = tk.Frame(charts, bg=BG)
-    bottom.pack(fill="both", expand=True)
-    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
-    loss_canvas.pack(side="left", fill="both", expand=True, padx=(0, 3))
-    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
-    jit_canvas.pack(side="left", fill="both", expand=True, padx=(3, 0))
+    bottom.grid(row=1, column=0, sticky="nsew")
+    bottom.rowconfigure(0, weight=1)
+    bottom.columnconfigure(0, weight=1, uniform="bottom")
+    bottom.columnconfigure(1, weight=1, uniform="bottom")
+    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+                            width=100, height=80)
+    loss_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+                           width=100, height=80)
+    jit_canvas.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
 
     def refresh_body():
         snap = engine.snapshot()
@@ -1594,7 +1642,7 @@ def enable_vt_mode():
 
 def run_console(engine, args):
     vt = enable_vt_mode()
-    print(f"Network Vitals  peer={args.peer}  bind={args.bind}  "
+    print(f"Network Vitals {__version__}  peer={args.peer}  bind={args.bind}  "
           f"{ports_summary()}  {args.pps} probes/s/stream")
     print("Ctrl-C to stop.\n")
     try:
@@ -1652,6 +1700,94 @@ def run_console(engine, args):
 
 
 # ---------------------------------------------------------------------------
+# Self-update: fetch the latest release of this file from UPDATE_URL and
+# replace ourselves in place. Only runs when explicitly requested (--update /
+# --check-update / update.bat) — a measurement tool must not phone home on
+# its own, and a surprise fetch would skew the very numbers it reports.
+# ---------------------------------------------------------------------------
+def _parse_version(text):
+    """Extract __version__ from source text as an int tuple, or None."""
+    m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    if not m:
+        return None, None
+    nums = tuple(int(x) for x in re.findall(r"\d+", m.group(1))[:3])
+    return (nums or None), m.group(1)
+
+
+def fetch_update(url, timeout=15):
+    """Download the candidate source. Returns (source_text, version_tuple,
+    version_string). Raises RuntimeError with a friendly message on any
+    problem — network, HTTP, or a payload that isn't a plausible newer us."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            raw = resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"download failed: {e}") from e
+    try:
+        src = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"payload is not UTF-8 text: {e}") from e
+    # Sanity: it must be valid Python and recognisably this application.
+    try:
+        compile(src, "netquality.py", "exec")
+    except SyntaxError as e:
+        raise RuntimeError(f"payload does not compile: {e}") from e
+    if "MAGIC" not in src or "Network Vitals" not in src:
+        raise RuntimeError("payload doesn't look like Network Vitals — wrong URL?")
+    vtuple, vstr = _parse_version(src)
+    if vtuple is None:
+        raise RuntimeError("payload has no __version__")
+    return src, vtuple, vstr
+
+
+def perform_update(url, apply=True):
+    """Check (and optionally install) the latest version. Returns an exit
+    code: 0 = up to date / updated, 1 = failed, 3 = update available (check
+    mode only, so scripts can branch on it)."""
+    local_v, _ = _parse_version(f'__version__ = "{__version__}"')
+    print(f"Network Vitals {__version__}")
+    print(f"Checking {url} …")
+    try:
+        src, remote_v, remote_s = fetch_update(url)
+    except RuntimeError as e:
+        print(f"Update check failed: {e}", file=sys.stderr)
+        return 1
+    if remote_v <= local_v:
+        print(f"Already up to date (latest is {remote_s}).")
+        return 0
+    print(f"New version available: {remote_s}")
+    if not apply:
+        return 3
+    if getattr(sys, "frozen", False):
+        print("This is a packaged .exe — it can't replace itself. Download "
+              "the new version (or rebuild with build_exe.bat) from:\n  "
+              + url, file=sys.stderr)
+        return 1
+    target = os.path.abspath(__file__)
+    backup = target + ".bak"
+    tmp = target + ".new"
+    try:
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(open(target, "r", encoding="utf-8").read())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        os.replace(tmp, target)  # atomic on the same filesystem
+    except OSError as e:
+        print(f"Install failed: {e}", file=sys.stderr)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return 1
+    print(f"Updated {os.path.basename(target)} {__version__} -> {remote_s}.")
+    print(f"(previous version saved as {os.path.basename(backup)})")
+    print("Restart the app to run the new version.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def _port_pair(text):
@@ -1672,7 +1808,19 @@ def _port_pair(text):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Bidirectional UDP/TCP network quality probe between two workstations.")
-    p.add_argument("--peer", required=True, help="IP address of the other workstation.")
+    p.add_argument("--version", action="version",
+                   version=f"Network Vitals {__version__}")
+    p.add_argument("--update", action="store_true",
+                   help="Fetch the latest version from the update URL, install "
+                        "it in place, and exit.")
+    p.add_argument("--check-update", action="store_true",
+                   help="Report whether a newer version is available, then exit "
+                        "(exit code 3 = update available).")
+    p.add_argument("--update-url", default=UPDATE_URL,
+                   help="Where --update/--check-update download from "
+                        "(default: the netvitals GitHub repo).")
+    p.add_argument("--peer", default=None,
+                   help="IP address of the other workstation.")
     p.add_argument("--bind", default="0.0.0.0",
                    help="Local address to bind/listen on (default: all interfaces).")
     p.add_argument("--udp-ports", type=_port_pair, default=DEFAULT_UDP_PORTS,
@@ -1820,6 +1968,15 @@ def run_mtu_sweep(args):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    if args.update or args.check_update:
+        return perform_update(args.update_url, apply=args.update)
+
+    if not args.peer:
+        print("error: --peer is required (except with --update/--check-update)",
+              file=sys.stderr)
+        return 2
+
     args.size = max(HEADER_LEN, min(args.size, MAX_SIZE))
     if args.pps < 1:
         args.pps = 1
@@ -1862,4 +2019,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
