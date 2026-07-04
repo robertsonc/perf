@@ -23,13 +23,16 @@ from poller import WireDelta
 log = logging.getLogger(__name__)
 
 
-# Matches the [SUM] interval lines emitted by iperf3 with -i N.
+# Matches the interval lines emitted by iperf3 with -i N. With -P >= 2 the
+# aggregate is on [SUM] lines; with -P 1 iperf3 emits ONLY per-stream lines
+# ("[  5] ..."), so the pattern accepts both and run_continuous() filters by
+# stream count.
 # TCP example:  [SUM]   1.00-2.00   sec   180 MBytes  1.51 Gbits/sec    0
-# UDP example:  [SUM]   1.00-2.00   sec   180 MBytes  1.51 Gbits/sec
+# UDP example:  [  5]   1.00-2.00   sec   180 MBytes  1.51 Gbits/sec
 # Final summary lines have a trailing "sender" or "receiver" — we skip those
 # by checking the role group.
 _SUM_INTERVAL_RE = re.compile(
-    r"^\[SUM\]\s+"
+    r"^\[(?:SUM|\s*\d+)\]\s+"
     r"(?P<t0>\d+(?:\.\d+)?)-(?P<t1>\d+(?:\.\d+)?)\s+sec\s+"
     r"(?P<bytes>\d+(?:\.\d+)?)\s+(?P<bytes_unit>[KMGT]?)Bytes\s+"
     r"(?P<rate>\d+(?:\.\d+)?)\s+(?P<rate_unit>[KMG]?)bits/sec"
@@ -303,7 +306,7 @@ class Iperf3Runner:
             cmd.append("-R")
         if ic.protocol == "udp":
             cmd.append("-u")
-            cmd += ["-b", ic.udp_bandwidth or "0"]
+            cmd += ["-b", self._udp_bandwidth()]
             if ic.udp_length:
                 cmd += ["-l", str(ic.udp_length)]
         else:
@@ -312,6 +315,18 @@ class Iperf3Runner:
             if ic.mss_bytes:
                 cmd += ["-M", str(ic.mss_bytes)]
         return cmd
+
+    def _udp_bandwidth(self) -> str:
+        """UDP target bandwidth — must be explicit. Defaulting to '-b 0'
+        (unlimited) floods the path at line rate, inducing the very loss the
+        harness is trying to measure, on what may be a shared demo network."""
+        bw = self._config.iperf3.udp_bandwidth
+        if not bw:
+            raise RuntimeError(
+                "protocol=udp requires iperf3.udp_bandwidth "
+                "(e.g. '100M', or '0' explicitly for unlimited)"
+            )
+        return bw
 
     def _build_continuous_cmd(self) -> list[str]:
         """Build iperf3 args for continuous text-mode streaming."""
@@ -336,7 +351,7 @@ class Iperf3Runner:
             cmd.append("-R")
         if ic.protocol == "udp":
             cmd.append("-u")
-            cmd += ["-b", ic.udp_bandwidth or "0"]
+            cmd += ["-b", self._udp_bandwidth()]
             if ic.udp_length:
                 cmd += ["-l", str(ic.udp_length)]
         else:
@@ -361,7 +376,14 @@ class Iperf3Runner:
         """
         cmd = self._build_continuous_cmd()
         log.info("iperf3 continuous: %s", " ".join(cmd))
-        t_offset = time.monotonic()
+        # Interval offsets are relative to when iperf3 starts the TEST, which
+        # is after process launch and the control-connection handshake (up to
+        # 5s with --connect-timeout 5000). Anchor the offset on the first
+        # interval line instead of the spawn time so counter windows are not
+        # skewed early by the connect latency.
+        t_offset: float | None = None
+        multi_stream = self._config.iperf3.parallel_streams > 1
+        is_udp = self._config.iperf3.protocol == "udp"
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -392,18 +414,27 @@ class Iperf3Runner:
                 if not line_b:
                     break  # EOF — process ended
                 line = line_b.decode("utf-8", errors="replace")
+                # With -P >= 2 only [SUM] lines carry the aggregate; the
+                # per-stream lines would double-count. With -P 1 there are
+                # no [SUM] lines at all, so the per-stream line IS the data.
+                if multi_stream and not line.lstrip().startswith("[SUM]"):
+                    continue
+                if t_offset is None:
+                    probe = _parse_interval_line(line, 0.0)
+                    if probe is None:
+                        continue
+                    t_offset = time.monotonic() - probe.t_end_mono
                 interval = _parse_interval_line(line, t_offset)
                 if interval is None:
                     continue
-                # Per-interval retx is cumulative since start in iperf3; the
-                # raw counter already represents the rolling total. Convert
-                # to per-interval delta for display.
-                this_interval_retx = max(
-                    0, interval.retransmits - cumulative_retx
-                )
-                cumulative_retx = interval.retransmits
+                if is_udp:
+                    # The trailing column on UDP client interval lines is the
+                    # datagram count, not TCP retransmits.
+                    interval.retransmits = 0
+                # iperf3's interval Retr column is already per-interval;
+                # accumulate it for the running total.
+                cumulative_retx += interval.retransmits
                 interval.cumulative_retransmits = cumulative_retx
-                interval.retransmits = this_interval_retx
                 yield interval
         finally:
             stderr_task.cancel()
@@ -478,8 +509,18 @@ class Iperf3Runner:
             return result
 
         result.raw = data
+        # iperf3 reports failures ("the server is busy running a test", etc.)
+        # as a top-level "error" field in otherwise-valid JSON, often with
+        # exit code != 0 and non-empty stdout.
+        if isinstance(data, dict) and data.get("error"):
+            result.error = str(data["error"])
         self._parse_iperf3_json(data, result)
-        result.success = result.goodput_mbps > 0.0
+        result.success = result.goodput_mbps > 0.0 and not result.error
+        if not result.success and not result.error:
+            result.error = (
+                stderr_b.decode("utf-8", "replace").strip()
+                or f"no data (iperf3 exited {proc.returncode})"
+            )
         return result
 
     @staticmethod
@@ -647,28 +688,43 @@ def analyze_run(
                 (frr_bulk - client_bulk) / client_bulk
             ) * 100.0
 
-    # End-to-end loss = client sent more than server received
-    if analysis.client and analysis.server:
-        client_bulk = analysis.client.bulk_bytes
-        server_bulk = analysis.server.bulk_bytes
-        if client_bulk > 0:
+    # End-to-end loss = the sending endpoint put more bytes on the wire than
+    # the receiving endpoint got. In an upload the client sends; in reverse
+    # (-R, download) the server sends — comparing the wrong way round made
+    # reverse-mode loss come out negative and clamp to a permanent 0%.
+    src_hop = analysis.server if reverse else analysis.client
+    dst_hop = analysis.client if reverse else analysis.server
+    if src_hop and dst_hop:
+        src_bulk = src_hop.bulk_bytes
+        dst_bulk = dst_hop.bulk_bytes
+        if src_bulk > 0:
             analysis.e2e_loss_pct = max(
                 0.0,
-                ((client_bulk - server_bulk) / client_bulk) * 100.0,
+                ((src_bulk - dst_bulk) / src_bulk) * 100.0,
             )
 
-    # Loss localization. Negative tunnel overhead (FRR saw fewer bytes than
-    # client) is a proxy for west-side loss. Clamp to e2e_loss_pct so the
-    # decomposition is physically consistent — total loss can't exceed what
-    # the server actually missed. Anything left over is east-side loss.
-    if analysis.tunnel_overhead_pct < 0:
-        raw_west = -analysis.tunnel_overhead_pct
-        analysis.west_loss_pct = min(raw_west, analysis.e2e_loss_pct)
-        analysis.east_loss_pct = max(
-            0.0, analysis.e2e_loss_pct - analysis.west_loss_pct
-        )
+    # Loss localization. If the FRR wire saw fewer bytes than the SENDING
+    # endpoint put out (negative source-relative overhead), the loss is on
+    # the source side of the FRR; whatever's left of e2e loss is on the
+    # destination side. For an upload the source side is west; in reverse
+    # the source is the server, so the sides swap. Clamp to e2e_loss_pct so
+    # the decomposition is physically consistent.
+    src_overhead_pct: float | None = None
+    if analysis.frr and src_hop and src_hop.bulk_bytes > 0:
+        src_overhead_pct = (
+            (analysis.frr.bulk_bytes - src_hop.bulk_bytes)
+            / src_hop.bulk_bytes
+        ) * 100.0
+    if src_overhead_pct is not None and src_overhead_pct < 0:
+        near_src_loss = min(-src_overhead_pct, analysis.e2e_loss_pct)
     else:
-        analysis.west_loss_pct = 0.0
-        analysis.east_loss_pct = analysis.e2e_loss_pct
+        near_src_loss = 0.0
+    far_loss = max(0.0, analysis.e2e_loss_pct - near_src_loss)
+    if reverse:
+        analysis.east_loss_pct = near_src_loss   # server side of the FRR
+        analysis.west_loss_pct = far_loss
+    else:
+        analysis.west_loss_pct = near_src_loss   # client side of the FRR
+        analysis.east_loss_pct = far_loss
 
     return analysis

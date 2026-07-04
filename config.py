@@ -6,15 +6,22 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-class DashboardConfig(BaseModel):
+class StrictModel(BaseModel):
+    """Reject unknown keys: a misspelled option (duration vs duration_s) must
+    be a loud config error, not a silent fall-back to defaults that quietly
+    changes what every published measurement means."""
+    model_config = ConfigDict(extra="forbid")
+
+
+class DashboardConfig(StrictModel):
     bind: str = "0.0.0.0"
     port: int = Field(default=8080, ge=1, le=65535)
 
 
-class Iperf3Config(BaseModel):
+class Iperf3Config(StrictModel):
     port: int = Field(default=5201, ge=1, le=65535)
     duration_s: int = Field(default=10, ge=1, le=3600)
     parallel_streams: int = Field(default=4, ge=1, le=128)
@@ -31,7 +38,7 @@ class Iperf3Config(BaseModel):
     udp_length: int | None = Field(default=None, ge=64, le=65507)
 
 
-class HostConfig(BaseModel):
+class HostConfig(StrictModel):
     mgmt_ip: str
     data_ip: str | None = None
     # Auto-detected from data_ip if not set. Override only if you have
@@ -40,6 +47,11 @@ class HostConfig(BaseModel):
     ssh_user: str | None = None
     ssh_key_path: str | None = None
     ssh_password_env: str | None = None
+    # Host keys are verified against this file (setup_ssh.py populates it on
+    # first contact). Set ssh_insecure_no_host_check: true to disable
+    # verification entirely — lab benches only, never on a shared network.
+    ssh_known_hosts: str = "~/.ssh/known_hosts"
+    ssh_insecure_no_host_check: bool = False
     iperf3_path: str = "iperf3"
 
     @field_validator("ssh_key_path")
@@ -62,29 +74,29 @@ class HostConfig(BaseModel):
         return pw
 
 
-class HostsConfig(BaseModel):
+class HostsConfig(StrictModel):
     client: HostConfig
     server: HostConfig
     frr: HostConfig
 
 
-class WanInterfaces(BaseModel):
+class WanInterfaces(StrictModel):
     ingress_iface: str
     egress_iface: str
 
 
-class ApplianceConfig(BaseModel):
+class ApplianceConfig(StrictModel):
     description: str = ""
     wan0: WanInterfaces
     wan1: WanInterfaces | None = None
 
 
-class ActiveConfig(BaseModel):
+class ActiveConfig(StrictModel):
     appliance: str
     dual_wan: bool = False
 
 
-class Config(BaseModel):
+class Config(StrictModel):
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     iperf3: Iperf3Config = Field(default_factory=Iperf3Config)
     poller_interval_s: float = Field(default=1.0, gt=0.0, le=60.0)

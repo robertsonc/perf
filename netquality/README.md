@@ -64,6 +64,25 @@ To stop trivial blips from denting a demo, a **loss deadband** (`--loss-deadband
 default 0.5%) treats a combined loss+late below the threshold as 0 for the score
 and the loss chart. (The lifetime totals always show the true raw counts.)
 
+## Hardening & behavior notes
+
+- **Start order doesn't matter.** On Windows, probing a peer whose app isn't
+  running yet used to kill the UDP receive thread (ICMP Port Unreachable
+  surfaces as a socket error); this is now suppressed and either side can be
+  started, stopped or rebooted at any time.
+- **Peer-only traffic.** Both the UDP and TCP listeners only answer the
+  configured `--peer` address. Other hosts on the LAN can't skew the stats or
+  use the tool as a packet reflector. (Run `--mtu-sweep` from the paired
+  machine for the same reason.)
+- **Mixed `--size` values interoperate.** TCP message framing is
+  self-describing, so the two ends may run different probe sizes.
+- **Restart-proof loss isolation.** The forward/return loss split survives
+  peer restarts, the Reset button, and deep packet reordering; the peer's
+  lifetime counters are re-baselined automatically.
+- **Single instance per port.** On Windows a second accidentally-launched
+  instance now fails to bind instead of silently splitting packets with the
+  first one (which used to read as huge random loss on both).
+
 ## Requirements
 
 - **Python 3.8+** (tested on 3.11). Nothing to `pip install` — it uses only the
