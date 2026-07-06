@@ -126,7 +126,10 @@ python netquality.py --peer 10.0.0.1
 ```
 
 That's the entire configuration. Or just double-click **`run.bat`** and type the
-peer's IP when prompted.
+peer's IP when prompted. Site defaults (probe `--size`, `--dont-fragment`) are
+set in variables at the top of `run.bat` — edit them once for your environment;
+anything passed after the peer IP (`run.bat 10.0.0.2 --size 200`) overrides
+them, since the last occurrence of a flag wins.
 
 ### Console mode (no GUI)
 

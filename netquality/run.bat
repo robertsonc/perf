@@ -1,10 +1,20 @@
 @echo off
 REM Launch Network Vitals. Shows this machine's IP, remembers the last peer
 REM used (lastpeer.txt next to this script), and prompts with it as the
-REM default. Pass the peer as the first argument to skip the prompt.
+REM default. Pass the peer as the first argument to skip the prompt; any
+REM further args pass through to netquality.py and override the site
+REM defaults below (the last occurrence of a flag wins).
 setlocal EnableDelayedExpansion
 title Network Vitals
 set "HISTFILE=%~dp0lastpeer.txt"
+
+REM ---- site defaults (edit these once for your environment) --------------
+REM 8164 B payload + 28 B UDP/IP = an 8192-byte frame (this system's max).
+set "SIZE=8164"
+REM DF=--dont-fragment makes oversized probes drop instead of fragmenting,
+REM so jumbo problems show up as loss. Set "DF=" to disable.
+set "DF=--dont-fragment"
+REM -------------------------------------------------------------------------
 
 REM --- this machine's IPv4 (adapter "Ethernet 3" on AutoPod workstations) ---
 set "MYIP="
@@ -41,5 +51,5 @@ if not defined PEER (
 
 >"%HISTFILE%" echo !PEER!
 echo Starting against peer !PEER! ...
-python "%~dp0netquality.py" --peer !PEER! %2 %3 %4 %5 %6 %7 %8 %9
+python "%~dp0netquality.py" --peer !PEER! --size %SIZE% %DF% %2 %3 %4 %5 %6 %7 %8 %9
 if errorlevel 1 pause
