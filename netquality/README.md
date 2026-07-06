@@ -64,6 +64,29 @@ To stop trivial blips from denting a demo, a **loss deadband** (`--loss-deadband
 default 0.5%) treats a combined loss+late below the threshold as 0 for the score
 and the loss chart. (The lifetime totals always show the true raw counts.)
 
+## Hardening & behavior notes
+
+- **Start order doesn't matter.** On Windows, probing a peer whose app isn't
+  running yet used to kill the UDP receive thread (ICMP Port Unreachable
+  surfaces as a socket error); this is now suppressed and either side can be
+  started, stopped or rebooted at any time.
+- **Peer-only traffic.** Both the UDP and TCP listeners only answer the
+  configured `--peer` address. Other hosts on the LAN can't skew the stats or
+  use the tool as a packet reflector. (Run `--mtu-sweep` from the paired
+  machine for the same reason.)
+- **Mixed `--size` values interoperate.** TCP message framing is
+  self-describing, so the two ends may run different probe sizes.
+- **Restart-proof loss isolation.** The forward/return loss split survives
+  peer restarts, the Reset button, and deep packet reordering; the peer's
+  lifetime counters are re-baselined automatically.
+- **Fit charts button.** If the charts ever end up mis-sized, ⤢ Fit charts
+  collapses the Totals/Isolate tables and re-fits the charts to the current
+  window. (The underlying layout bug — charts staying tiny after closing
+  Totals — is also fixed.)
+- **Single instance per port.** On Windows a second accidentally-launched
+  instance now fails to bind instead of silently splitting packets with the
+  first one (which used to read as huge random loss on both).
+
 ## Requirements
 
 - **Python 3.8+** (tested on 3.11). Nothing to `pip install` — it uses only the
@@ -71,6 +94,22 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
   Python installer for Windows.
 - No clock synchronization between the two machines is required (latency is
   measured by round-trip, so both clocks are irrelevant).
+
+## Updating
+
+The app can update itself from the [netvitals repo](https://github.com/robertsonc/netvitals):
+
+```
+update.bat                      REM or: python netquality.py --update
+python netquality.py --check-update   REM report only (exit code 3 = update available)
+```
+
+`--update` downloads the latest `netquality.py`, sanity-checks it (compiles,
+recognisably this app, higher `__version__`), keeps the previous copy as
+`netquality.py.bak`, and swaps the file atomically. Restart to run the new
+version. A packaged `.exe` can't replace itself — rebuild with
+`build_exe.bat` after updating the source. Updates are only ever fetched when
+explicitly requested; the app never phones home on its own.
 
 ## Running it
 

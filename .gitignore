@@ -5,3 +5,5 @@ __pycache__/
 netquality/dist/
 netquality/build/
 *.spec
+netquality/lastpeer.txt
+netquality/*.bak

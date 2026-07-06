@@ -43,6 +43,9 @@ your iperf3 numbers are wrong (TSO/GSO accounting, etc.).
 
 ## Setup
 
+Requires **Python 3.10+** on the orchestrator host (uses `dataclass(slots=True)`
+and PEP 604 unions at runtime).
+
 ```bash
 # 1. Deps
 python3 -m venv .venv && source .venv/bin/activate
@@ -54,6 +57,10 @@ ssh-copy-id aruba@192.168.2.102        # FRR
 ssh-copy-id aruba@192.168.2.123        # server
 ssh -i ~/.ssh/id_ed25519 aruba@192.168.2.102 'cat /proc/net/dev | head -3'
 ssh -i ~/.ssh/id_ed25519 aruba@192.168.2.123 'iperf3 --version'
+
+# SSH host keys are verified against ~/.ssh/known_hosts (the ssh-copy-id
+# step above records them). For an isolated bench you can disable
+# verification with ssh_insecure_no_host_check: true per host in config.
 
 # 3. Config
 cp config.example.yaml config.yaml

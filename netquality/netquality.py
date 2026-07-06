@@ -29,12 +29,22 @@ Local loopback smoke test (one machine, Linux only - two loopback aliases):
 
 import argparse
 import math
+import os
+import re
 import socket
 import struct
 import sys
 import threading
 import time
+import traceback
 from collections import deque
+
+__version__ = "1.1.0"
+
+# Where --update / --check-update look for the latest release of this file.
+# Override with --update-url (or keep a fork's URL here).
+UPDATE_URL = ("https://raw.githubusercontent.com/robertsonc/netvitals/"
+              "main/netquality.py")
 
 # ---------------------------------------------------------------------------
 # Wire protocol
@@ -115,7 +125,7 @@ def build_packet(ptype, sid, seq, ts_ns, size, rxsize=0, rxcount=0):
         size = HEADER_LEN
     if size > MAX_SIZE:
         size = MAX_SIZE
-    hdr = HEADER.pack(MAGIC, ptype, sid, seq, ts_ns, size,
+    hdr = HEADER.pack(MAGIC, ptype, sid, seq & MAX_COUNT, ts_ns, size,
                       min(rxsize, MAX_SIZE), rxcount & MAX_COUNT)
     return hdr + b"\x00" * (size - HEADER_LEN)
 
@@ -146,6 +156,54 @@ def enlarge_socket_buffers(sock):
             sock.setsockopt(socket.SOL_SOCKET, opt, SOCK_BUF_BYTES)
         except OSError:
             pass
+
+
+def bind_exclusively(sock):
+    """Bind-time socket options, per platform.
+
+    On Windows SO_REUSEADDR lets a SECOND process bind the very same UDP/TCP
+    port, after which inbound packets are split between the two processes
+    nondeterministically — an accidentally double-launched instance reads as
+    huge random packet loss. SO_EXCLUSIVEADDRUSE restores sane semantics.
+    Elsewhere SO_REUSEADDR just skips TIME_WAIT on restart.
+    """
+    if sys.platform == "win32":
+        opt = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if opt is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, opt, 1)
+            except OSError:
+                pass
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
+def quench_udp_connreset(sock):
+    """Stop Windows from surfacing ICMP Port Unreachable as an error on the
+    UDP socket itself.
+
+    When the peer app isn't running yet, our sendto() elicits ICMP Port
+    Unreachable and Windows then raises ConnectionResetError (WSAECONNRESET)
+    from the NEXT recvfrom() on the same socket. Without this ioctl the
+    receive loop would die just because the other workstation was started a
+    minute later. No-op on non-Windows platforms.
+    """
+    if sys.platform != "win32":
+        return
+    SIO_UDP_CONNRESET = 0x9800000C
+    try:
+        sock.ioctl(SIO_UDP_CONNRESET, False)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def resolve_peer_ip(peer):
+    """Resolve the peer to an IP for source-address filtering (None if we
+    can't resolve, in which case filtering is skipped)."""
+    try:
+        return socket.gethostbyname(peer)
+    except OSError:
+        return None
 
 
 def set_dont_fragment(sock):
@@ -188,22 +246,24 @@ class StreamStats:
         self.window = window          # seconds of history kept for rates/loss
         self.timeout = timeout        # an un-echoed probe older than this = lost
         self.target_pps = target_pps  # offered probe rate (for throughput ratio)
-        self.window_start = time.time()  # for accurate rates before window fills
+        # All window bookkeeping uses time.monotonic(): an NTP step on the
+        # wall clock must not empty the window or freeze rate/loss figures.
+        self.window_start = time.monotonic()  # for accurate rates before window fills
 
-        self.rtt_samples = deque()    # (t_wall, rtt_ms) for on-time echoes only
-        self.tx_events = deque()      # t_wall of probes sent
+        self.rtt_samples = deque()    # (t_mono, rtt_ms) for on-time echoes only
+        self.tx_events = deque()      # t_mono of probes sent
         self.connect_samples = deque(maxlen=8)  # recent TCP connect times (ms)
 
         # Windowed per-probe outcomes. `resolved_order` keeps insertion order so
         # we can trim by time; `state` maps seq -> 'recv'|'lost'|'late' and is
         # updated in place when a lost probe is later reclassified as late.
-        self.resolved_order = deque() # (resolve_wall, seq)
+        self.resolved_order = deque() # (resolve_mono, seq)
         self.state = {}               # seq -> outcome
 
-        self.pending = {}             # seq -> (send_wall, send_monotonic_ns)
+        self.pending = {}             # seq -> (send_mono, send_monotonic_ns)
         self.jitter = 0.0             # RFC-3550 style smoothed jitter (ms)
         self.last_rtt = None
-        self.last_echo_t = 0.0        # wallclock of most recent echo (any kind)
+        self.last_echo_t = 0.0        # monotonic time of most recent echo (any kind)
 
         # cumulative session counters (for the footer / totals)
         self.cum_tx = 0
@@ -226,7 +286,16 @@ class StreamStats:
         self.refl_max = 0         # highest peer seq seen this run
         self.refl_run = 0         # probes received in the current seq run
         self.refl_gap = 0         # forward-loss gaps finalized from prior runs
-        self.peer_fwd = 0         # forward-loss count the peer reports (max seen)
+        # Candidate peer-restart marker: (seq, counted_into_run). A single
+        # large backward seq jump may just be a deeply reordered packet; two
+        # in a row with ascending seqs confirm the peer restarted.
+        self._reset_pend = None
+        self.peer_fwd = 0         # forward-loss count the peer reports (see on_echo)
+        self.peer_fwd_seq = 0     # seq of the echo that carried peer_fwd
+        # The peer's reflector counter is a LIFETIME total that survives our
+        # Reset button and our process restarting. Baseline it against the
+        # first echo we see so only gaps accrued during THIS session count.
+        self.peer_fwd_base = None
 
     # -- producers (called from network threads) --------------------------
     def on_probe_rx(self, seq):
@@ -238,22 +307,39 @@ class StreamStats:
                 self.refl_first = self.refl_max = seq
                 self.refl_run = 1
             elif seq < self.refl_max - 100:
-                # large backward jump = seq reset (TCP reconnect): bank the
-                # current run's gaps and start a fresh run.
-                self.refl_gap += max(0, (self.refl_max - self.refl_first + 1) - self.refl_run)
-                self.refl_first = self.refl_max = seq
-                self.refl_run = 1
+                # A large backward jump is EITHER the peer's app restarting
+                # (its seq begins again near 1) or a packet reordered/delayed
+                # by hundreds of positions. Require two such packets in a row
+                # with ascending seqs before declaring a restart; a lone one
+                # is treated as a very-late member of the current run, so deep
+                # reordering can no longer fabricate hundreds of phantom
+                # forward losses.
+                if self._reset_pend is not None and 0 <= seq - self._reset_pend[0] <= 100:
+                    pend_seq, pend_counted = self._reset_pend
+                    run = self.refl_run - (1 if pend_counted else 0)
+                    self.refl_gap += max(0, (self.refl_max - self.refl_first + 1) - run)
+                    self.refl_first = pend_seq
+                    self.refl_max = seq
+                    self.refl_run = 2  # the candidate probe + this one
+                    self._reset_pend = None
+                else:
+                    counted = seq >= self.refl_first
+                    if counted:
+                        self.refl_run += 1  # gap-filler within the current run
+                    self._reset_pend = (seq, counted)
             else:
+                self._reset_pend = None
                 if seq > self.refl_max:
                     self.refl_max = seq
                 self.refl_run += 1
             live_gap = max(0, (self.refl_max - self.refl_first + 1) - self.refl_run)
-            return self.refl_gap + live_gap
+            return (self.refl_gap + live_gap) & MAX_COUNT
 
     def on_send(self, seq, send_ns):
         with self.lock:
-            self.pending[seq] = (time.time(), send_ns)
-            self.tx_events.append(time.time())
+            now_m = time.monotonic()
+            self.pending[seq] = (now_m, send_ns)
+            self.tx_events.append(now_m)
             self.cum_tx += 1
             self._trim_locked()
 
@@ -262,7 +348,7 @@ class StreamStats:
             rtt = (now_ns - ts_ns) / 1e6
             if rtt < 0:
                 rtt = 0.0
-            now_w = time.time()
+            now_w = time.monotonic()
             # Size verification: rx_len = echo we got back (return path), peer_rx
             # = bytes the reflector reported (forward path). psize = intended.
             if rx_len > self.rx_echo_max:
@@ -271,10 +357,20 @@ class StreamStats:
                 self.peer_rx_max = peer_rx
             if psize and ((rx_len and rx_len != psize) or (peer_rx and peer_rx != psize)):
                 self.size_mismatch += 1
-            # Loss localization: peer_fwd = forward-loss gaps the peer has seen
-            # in our sequence (monotonic; keep the max seen).
-            if peer_fwd > self.peer_fwd:
-                self.peer_fwd = peer_fwd
+            # Loss localization: peer_fwd = forward-loss gaps the peer's
+            # reflector reports. Take the value carried by the highest-seq echo
+            # seen (≈ the reflector's most recent count) rather than max-
+            # latching, so a transient reorder spike in the peer's live gap
+            # heals instead of ratcheting up forever. The first echo after a
+            # reset (or process start) baselines the peer's lifetime counter,
+            # since the reflector's total survives our Reset button / restart.
+            if self.peer_fwd_base is None or peer_fwd < self.peer_fwd_base:
+                # First echo of the session, or the peer's counter went
+                # backward (its app restarted): re-baseline.
+                self.peer_fwd_base = peer_fwd
+            if seq >= self.peer_fwd_seq:
+                self.peer_fwd_seq = seq
+                self.peer_fwd = max(0, peer_fwd - self.peer_fwd_base)
             p = self.pending.pop(seq, None)
             if p is not None:
                 # On-time echo.
@@ -303,7 +399,7 @@ class StreamStats:
         now_ns = time.monotonic_ns()
         cutoff = self.timeout * 1e9
         with self.lock:
-            now_w = time.time()
+            now_w = time.monotonic()
             dead = [s for s, (w, ns) in self.pending.items() if now_ns - ns > cutoff]
             for s in dead:
                 self.pending.pop(s, None)
@@ -321,7 +417,7 @@ class StreamStats:
     def snapshot(self):
         with self.lock:
             self._trim_locked()
-            now = time.time()
+            now = time.monotonic()
             rtts = [r for _, r in self.rtt_samples]
             recv = lost = late = 0
             for st in self.state.values():
@@ -411,14 +507,19 @@ class StreamStats:
             self.jitter = 0.0
             self.last_rtt = None
             self.last_echo_t = 0.0
-            self.window_start = time.time()
+            self.window_start = time.monotonic()
             self.cum_tx = self.cum_recv = self.cum_lost = self.cum_late = 0
             self.rx_echo_max = self.peer_rx_max = self.size_mismatch = 0
             self.refl_rx = self.peer_fwd = 0
             self.refl_first = self.refl_max = self.refl_run = self.refl_gap = 0
+            self._reset_pend = None
+            # Re-baseline against the peer's lifetime reflector counter on the
+            # next echo; the peer has no notion of our Reset button.
+            self.peer_fwd_seq = 0
+            self.peer_fwd_base = None
 
     def _trim_locked(self):
-        horizon = time.time() - self.window
+        horizon = time.monotonic() - self.window
         while self.rtt_samples and self.rtt_samples[0][0] < horizon:
             self.rtt_samples.popleft()
         while self.tx_events and self.tx_events[0] < horizon:
@@ -547,17 +648,20 @@ class UDPStream:
         self.stop = stop
         self.dont_fragment = dont_fragment
         self.sock = None
+        self.peer_ip = None
         self.threads = []
 
     def start(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bind_exclusively(s)        # a second accidental instance must fail loudly
         enlarge_socket_buffers(s)  # absorb Windows microbursts -> no phantom UDP loss
+        quench_udp_connreset(s)    # peer not started yet must not error the socket
         if self.dont_fragment:
             set_dont_fragment(s)   # jumbo probes that don't fit are dropped, not split
         s.bind((self.bind, self.port))
         s.settimeout(0.5)
         self.sock = s
+        self.peer_ip = resolve_peer_ip(self.peer)
         self.threads = [
             threading.Thread(target=self._recv_loop, name=f"{self.name}-rx", daemon=True),
             threading.Thread(target=self._send_loop, name=f"{self.name}-tx", daemon=True),
@@ -592,8 +696,19 @@ class UDPStream:
                 data, addr = self.sock.recvfrom(65535)
             except socket.timeout:
                 continue
+            except ConnectionResetError:
+                # Windows: ICMP Port Unreachable from a prior sendto (peer app
+                # not running yet). Not a socket failure — keep receiving.
+                continue
             except OSError:
-                break
+                if self.stop.is_set():
+                    break
+                time.sleep(0.1)  # unexpected; don't spin, don't die
+                continue
+            # Only talk to the configured peer: a hostile/chatty LAN must not
+            # be able to skew stats or use us as a packet reflector.
+            if self.peer_ip is not None and addr[0] != self.peer_ip:
+                continue
             parsed = parse_header(data)
             if parsed is None:
                 continue
@@ -620,19 +735,56 @@ class UDPStream:
 # TCP stream: we run BOTH a server (reflect peer's probes) and a client
 # (originate our probes). Our displayed stats come from the client side.
 # ---------------------------------------------------------------------------
-def _recv_exact(sock, n):
+def _recv_exact(sock, n, stop=None, idle_timeout=None):
+    """Read exactly n bytes. Returns None if the stream dies, `stop` is set,
+    or no data arrives for `idle_timeout` seconds (silent peer death — a
+    blue-screened / hard-powered-off peer never sends FIN or RST, and without
+    a deadline the reader thread would spin on 0.5 s timeouts forever)."""
     buf = bytearray()
+    last_data = time.monotonic()
     while len(buf) < n:
+        if stop is not None and stop.is_set():
+            return None
         try:
             chunk = sock.recv(n - len(buf))
         except (socket.timeout, BlockingIOError):
+            if (idle_timeout is not None
+                    and time.monotonic() - last_data > idle_timeout):
+                return None
             continue
         except OSError:
             return None
         if not chunk:
             return None
         buf.extend(chunk)
+        last_data = time.monotonic()
     return bytes(buf)
+
+
+def _recv_msg(sock, stop=None, idle_timeout=None):
+    """Read one framed message: the fixed header first, then the padding the
+    header's own psize field declares.
+
+    Framing is self-describing, so the two workstations may run different
+    --size values without permanently desyncing the byte stream (which used
+    to read as 100% phantom TCP loss). A magic mismatch means the stream is
+    desynced or foreign; returning None makes the caller drop the connection,
+    which is the only reliable way to resync."""
+    hdr = _recv_exact(sock, HEADER_LEN, stop=stop, idle_timeout=idle_timeout)
+    if hdr is None:
+        return None
+    fields = HEADER.unpack(hdr)
+    if fields[0] != MAGIC:
+        return None
+    psize = fields[5]
+    if psize < HEADER_LEN or psize > MAX_SIZE:
+        return None
+    if psize == HEADER_LEN:
+        return hdr
+    rest = _recv_exact(sock, psize - HEADER_LEN, stop=stop, idle_timeout=idle_timeout)
+    if rest is None:
+        return None
+    return hdr + rest
 
 
 class TCPStream:
@@ -646,9 +798,19 @@ class TCPStream:
         self.stop = stop
         self.listen_sock = None
         self.client_sock = None
+        self.peer_ip = None
         self.threads = []
+        # Probe seq continues across reconnects (see _client_send).
+        self._tx_seq = 0
+        # At most one live reflector connection: when the peer reconnects, the
+        # old (usually half-dead) connection is closed so its thread exits
+        # instead of leaking, and so two connections can't interleave probes
+        # into the same StreamStats.
+        self._reflect_lock = threading.Lock()
+        self._active_reflect = None
 
     def start(self):
+        self.peer_ip = resolve_peer_ip(self.peer)
         self.threads = [
             threading.Thread(target=self._server_loop, name=f"{self.name}-srv", daemon=True),
             threading.Thread(target=self._client_manager, name=f"{self.name}-cli", daemon=True),
@@ -660,21 +822,53 @@ class TCPStream:
     # -- server side: reflect peer probes ---------------------------------
     def _server_loop(self):
         ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            ls.bind((self.bind, self.port))
-            ls.listen(8)
-        except OSError:
+        bind_exclusively(ls)
+        warned = False
+        while not self.stop.is_set():
+            try:
+                ls.bind((self.bind, self.port))
+                ls.listen(8)
+                break
+            except OSError as e:
+                # Port taken (lingering old instance, another app): keep
+                # retrying instead of silently never reflecting — the only
+                # symptom used to appear on the PEER's screen.
+                if not warned:
+                    print(f"{self.name}: cannot listen on {self.bind}:{self.port}"
+                          f" ({e}) - retrying every 5s; until then the peer "
+                          f"will show this stream down.", file=sys.stderr)
+                    warned = True
+                if self.stop.wait(5.0):
+                    return
+        if self.stop.is_set():
             return
+        if warned:
+            print(f"{self.name}: now listening on {self.bind}:{self.port}",
+                  file=sys.stderr)
         ls.settimeout(0.5)
         self.listen_sock = ls
         while not self.stop.is_set():
             try:
-                conn, _ = ls.accept()
+                conn, addr = ls.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
+            if self.peer_ip is not None and addr[0] != self.peer_ip:
+                # Only reflect for the configured peer (hostile-LAN hardening:
+                # no thread-per-connection for arbitrary hosts).
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            with self._reflect_lock:
+                old, self._active_reflect = self._active_reflect, conn
+            if old is not None:
+                try:
+                    old.close()  # unblocks the old reflector thread -> exits
+                except OSError:
+                    pass
             threading.Thread(target=self._reflect_conn, args=(conn,), daemon=True).start()
 
     def _reflect_conn(self, conn):
@@ -685,7 +879,9 @@ class TCPStream:
             pass
         with conn:
             while not self.stop.is_set():
-                msg = _recv_exact(conn, self.size)
+                # 30s with no bytes = silently dead peer (no FIN/RST after a
+                # crash/power-off); exit rather than leak this thread forever.
+                msg = _recv_msg(conn, stop=self.stop, idle_timeout=30.0)
                 if msg is None:
                     return
                 parsed = parse_header(msg)
@@ -694,12 +890,23 @@ class TCPStream:
                 ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
                 if ptype == TYPE_PROBE:
                     fwd = self.stats.on_probe_rx(seq)
-                    echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, self.size,
+                    # Echo at the PROBE's size (not our local --size) so the
+                    # originator's reader frames it correctly even when the
+                    # two ends run different sizes.
+                    echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, len(msg),
                                         rxsize=len(msg), rxcount=fwd)
                     try:
                         conn.sendall(echo)
                     except OSError:
                         return
+
+    def _source_address(self):
+        """Source address for outbound TCP, so the peer's reflector sees us
+        arrive from the address it has configured as its --peer (essential on
+        multi-homed hosts and the loopback smoke test)."""
+        if self.bind in ("", "0.0.0.0"):
+            return None
+        return (self.bind, 0)
 
     # -- connection-establishment sampler (PQI input) ----------------------
     def _connect_sampler(self):
@@ -707,7 +914,8 @@ class TCPStream:
         while not self.stop.wait(15.0):
             t0 = time.monotonic()
             try:
-                s = socket.create_connection((self.peer, self.port), timeout=3.0)
+                s = socket.create_connection((self.peer, self.port), timeout=3.0,
+                                             source_address=self._source_address())
                 self.stats.on_connect((time.monotonic() - t0) * 1000.0)
                 s.close()
             except OSError:
@@ -718,7 +926,8 @@ class TCPStream:
         while not self.stop.is_set():
             t0 = time.monotonic()
             try:
-                cs = socket.create_connection((self.peer, self.port), timeout=2.0)
+                cs = socket.create_connection((self.peer, self.port), timeout=2.0,
+                                              source_address=self._source_address())
             except OSError:
                 self.stop.wait(1.0)
                 continue
@@ -741,10 +950,15 @@ class TCPStream:
                 self.stop.wait(0.5)  # brief backoff before reconnect
 
     def _client_send(self, cs):
-        seq = 0
+        # seq continues across reconnects so the peer's reflector sees ONE
+        # monotonic sequence: the gap across a reconnect is exactly the probes
+        # that died with the old connection (real forward loss), and pending
+        # entries from the old connection are reaped as lost instead of being
+        # silently overwritten by a restarted sequence.
         next_t = time.monotonic()
         while not self.stop.is_set():
-            seq += 1
+            self._tx_seq += 1
+            seq = self._tx_seq
             ns = time.monotonic_ns()
             pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, self.size)
             try:
@@ -762,7 +976,7 @@ class TCPStream:
 
     def _client_recv(self, cs):
         while not self.stop.is_set():
-            msg = _recv_exact(cs, self.size)
+            msg = _recv_msg(cs, stop=self.stop)
             if msg is None:
                 return
             parsed = parse_header(msg)
@@ -786,7 +1000,7 @@ class Engine:
         self.size = size
         self.dont_fragment = dont_fragment
         self.stop = threading.Event()
-        self.start_time = time.time()
+        self.start_time = time.monotonic()
         self.history_seconds = history_seconds
         self.loss_deadband = loss_deadband  # combined loss+late below this reads as 0
         interval = 1.0 / pps
@@ -821,7 +1035,7 @@ class Engine:
     def _sampler(self):
         """Append one history sample per stream every second."""
         while not self.stop.wait(1.0):
-            now = time.time()
+            now = time.monotonic()  # chart X axis; immune to NTP steps
             with self.history_lock:
                 for sid in self.history:
                     snap = self.stats[sid].snapshot()
@@ -915,7 +1129,7 @@ class Engine:
             "tcp_pqi": tcp_pqi,
             "worst": worst,
             "overall_label": score_label(overall) if scores else "No link",
-            "uptime": time.time() - self.start_time,
+            "uptime": time.monotonic() - self.start_time,
             "links_up": len(scores),
             "totals": totals,
             "frame_size": self.size,
@@ -1077,7 +1291,7 @@ def run_gui(engine, args):
               for sid, proto, port, name in STREAMS]
 
     root = tk.Tk()
-    root.title(f"Network Vitals  -  peer {args.peer}")
+    root.title(f"Network Vitals {__version__}  -  peer {args.peer}")
     root.geometry("1000x600")
     root.minsize(480, 320)
     root.configure(bg=BG)
@@ -1121,12 +1335,15 @@ def run_gui(engine, args):
     totals_shown = {"on": False}
 
     def do_toggle_totals():
+        # Toggle the whole FRAME, not the tree inside it: an emptied,
+        # still-packed frame keeps its last requested size, which is what
+        # used to leave the bottom charts squeezed after closing the table.
         totals_shown["on"] = not totals_shown["on"]
         if totals_shown["on"]:
-            totals_tree.pack(fill="x")
+            totals_frame.pack(fill="x", side="bottom", before=charts)
             totals_btn.configure(text="▴  Totals")
         else:
-            totals_tree.pack_forget()
+            totals_frame.pack_forget()
             totals_btn.configure(text="▾  Totals")
 
     totals_btn = tk.Button(header, text="▾  Totals", command=do_toggle_totals,
@@ -1141,10 +1358,10 @@ def run_gui(engine, args):
     def do_toggle_isolate():
         isolate_shown["on"] = not isolate_shown["on"]
         if isolate_shown["on"]:
-            iso_tree.pack(fill="x")
+            iso_frame.pack(fill="x", side="bottom", before=charts)
             isolate_btn.configure(text="▴  Isolate")
         else:
-            iso_tree.pack_forget()
+            iso_frame.pack_forget()
             isolate_btn.configure(text="⇄  Isolate")
 
     isolate_btn = tk.Button(header, text="⇄  Isolate", command=do_toggle_isolate,
@@ -1152,7 +1369,25 @@ def run_gui(engine, args):
                             activeforeground="white", relief="flat", bd=0,
                             highlightthickness=0, padx=12, pady=5,
                             font=(FONT, 9, "bold"), cursor="hand2")
-    isolate_btn.pack(side="left")
+    isolate_btn.pack(side="left", padx=(0, 6))
+
+    def do_fit_charts():
+        """Collapse the bottom tables and force a fresh geometry pass so the
+        charts reclaim the full current window space."""
+        if totals_shown["on"]:
+            do_toggle_totals()
+        if isolate_shown["on"]:
+            do_toggle_isolate()
+        for c in (lat_canvas, loss_canvas, jit_canvas):
+            c.configure(width=100, height=80)
+        root.update_idletasks()
+
+    fit_btn = tk.Button(header, text="⤢  Fit charts", command=do_fit_charts,
+                        bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                        activeforeground="white", relief="flat", bd=0,
+                        highlightthickness=0, padx=12, pady=5,
+                        font=(FONT, 9, "bold"), cursor="hand2")
+    fit_btn.pack(side="left")
 
     # right-hand stat cluster: quality text + experience score + composite MOS
     stats = tk.Frame(header, bg=BG)
@@ -1209,9 +1444,10 @@ def run_gui(engine, args):
     totals_w = {"stream": 110, "sent": 78, "recv": 84, "lost": 64, "late": 60,
                 "lossp": 64, "txb": 66, "peerrx": 78, "echorx": 72, "size": 80}
     totals_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    totals_frame.pack(fill="x", side="bottom")
+    # not packed here — do_toggle_totals packs/unpacks the whole frame
     totals_tree = ttk.Treeview(totals_frame, columns=totals_cols, show="headings",
                                height=len(STREAMS), style="NQ.Treeview")
+    totals_tree.pack(fill="x")
     for c in totals_cols:
         totals_tree.heading(c, text=totals_head[c])
         totals_tree.column(c, width=totals_w[c], anchor=("w" if c == "stream" else "e"),
@@ -1221,7 +1457,7 @@ def run_gui(engine, args):
     for sid, proto, port, name in STREAMS:
         totals_tree.insert("", "end", iid=f"t{sid}",
                            values=(name, 0, 0, 0, 0, "0.0", 0, 0, 0, "-"))
-    # not packed yet -> hidden until the Totals button is clicked
+    # frame stays unpacked -> hidden until the Totals button is clicked
 
     # ---- isolate table (hidden; splits loss into forward vs return) --------
     iso_cols = ("stream", "sent", "fwd", "fwdp", "rtn", "rtnp", "where")
@@ -1231,9 +1467,10 @@ def run_gui(engine, args):
     iso_w = {"stream": 110, "sent": 84, "fwd": 120, "fwdp": 70,
              "rtn": 120, "rtnp": 70, "where": 110}
     iso_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    iso_frame.pack(fill="x", side="bottom")
+    # not packed here — do_toggle_isolate packs/unpacks the whole frame
     iso_tree = ttk.Treeview(iso_frame, columns=iso_cols, show="headings",
                             height=len(STREAMS), style="NQ.Treeview")
+    iso_tree.pack(fill="x")
     for c in iso_cols:
         iso_tree.heading(c, text=iso_head[c])
         iso_tree.column(c, width=iso_w[c], anchor=("w" if c in ("stream", "where") else "e"),
@@ -1243,21 +1480,38 @@ def run_gui(engine, args):
     for sid, proto, port, name in STREAMS:
         iso_tree.insert("", "end", iid=f"i{sid}",
                         values=(name, 0, 0, "0.00", 0, "0.00", "…"))
-    # not packed yet -> hidden until the Isolate button is clicked
+    # frame stays unpacked -> hidden until the Isolate button is clicked
 
     # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
+    # Laid out with grid + row weights, NOT pack: pack hands the space freed
+    # by a collapsing sibling (the Totals/Isolate tables) to the first
+    # expandable widget only, so after opening and closing Totals the bottom
+    # chart row stayed squeezed to a sliver until the app was restarted.
+    # Grid weights re-distribute the space proportionally on every geometry
+    # pass, so the charts always track the current window size.
     charts = tk.Frame(root, bg=BG, padx=12, pady=6)
     charts.pack(fill="both", expand=True)
-    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0)
-    lat_canvas.pack(fill="both", expand=True, pady=(0, 6))
+    charts.columnconfigure(0, weight=1)
+    charts.rowconfigure(0, weight=3, uniform="charts")
+    charts.rowconfigure(1, weight=2, uniform="charts")
+    # Small requested sizes: the drawn size is allocation-driven, and modest
+    # requests keep the layout solvable at any window size.
+    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0,
+                           width=100, height=80)
+    lat_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
     bottom = tk.Frame(charts, bg=BG)
-    bottom.pack(fill="both", expand=True)
-    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
-    loss_canvas.pack(side="left", fill="both", expand=True, padx=(0, 3))
-    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0)
-    jit_canvas.pack(side="left", fill="both", expand=True, padx=(3, 0))
+    bottom.grid(row=1, column=0, sticky="nsew")
+    bottom.rowconfigure(0, weight=1)
+    bottom.columnconfigure(0, weight=1, uniform="bottom")
+    bottom.columnconfigure(1, weight=1, uniform="bottom")
+    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+                            width=100, height=80)
+    loss_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+                           width=100, height=80)
+    jit_canvas.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
 
-    def refresh():
+    def refresh_body():
         snap = engine.snapshot()
         def set_metric(var, num, value, fmt, color_score):
             if value is None:
@@ -1327,7 +1581,7 @@ def run_gui(engine, args):
                     size_cell))
 
         hist = engine.history_copy()
-        now = time.time()
+        now = time.monotonic()  # history samples are stamped with monotonic time
         _draw_chart(lat_canvas, "Latency (RTT, ms)", "rtt", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
@@ -1337,7 +1591,21 @@ def run_gui(engine, args):
         _draw_chart(jit_canvas, "Jitter (ms)", "jitter", series, hist,
                     view_seconds, now, ymin_floor=1.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
-        root.after(args.refresh_ms, refresh)
+
+    def refresh():
+        # One bad tick must not kill the whole update chain: on an unattended
+        # demo screen a single swallowed exception used to freeze the UI on
+        # stale numbers forever while probing kept running underneath.
+        try:
+            refresh_body()
+        except tk.TclError:
+            return  # window is being torn down
+        except Exception:
+            traceback.print_exc()
+        try:
+            root.after(args.refresh_ms, refresh)
+        except tk.TclError:
+            pass
 
     def on_close():
         engine.shutdown()
@@ -1351,14 +1619,39 @@ def run_gui(engine, args):
 # ---------------------------------------------------------------------------
 # Console UI (fallback when no display / --no-gui)
 # ---------------------------------------------------------------------------
+def enable_vt_mode():
+    """Enable ANSI escape processing in the Windows console. Classic
+    conhost/cmd.exe ships with it OFF, so without this the console UI prints
+    literal '←[2J←[H' garbage instead of clearing the screen. Returns True if
+    escapes will render."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        return bool(k32.SetConsoleMode(
+            handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+    except Exception:
+        return False
+
+
 def run_console(engine, args):
-    print(f"Network Vitals  peer={args.peer}  bind={args.bind}  "
+    vt = enable_vt_mode()
+    print(f"Network Vitals {__version__}  peer={args.peer}  bind={args.bind}  "
           f"{ports_summary()}  {args.pps} probes/s/stream")
     print("Ctrl-C to stop.\n")
     try:
         while not engine.stop.is_set():
             snap = engine.snapshot()
-            print("\033[2J\033[H", end="")  # clear screen
+            if vt:
+                print("\033[2J\033[H", end="")  # clear screen
+            else:
+                os.system("cls" if sys.platform == "win32" else "clear")
             o = snap["overall"]
             um = f"{snap['udp_mos']:.2f}" if snap["udp_mos"] is not None else "-"
             tq = f"{snap['tcp_pqi']:.0f}" if snap["tcp_pqi"] is not None else "-"
@@ -1407,6 +1700,94 @@ def run_console(engine, args):
 
 
 # ---------------------------------------------------------------------------
+# Self-update: fetch the latest release of this file from UPDATE_URL and
+# replace ourselves in place. Only runs when explicitly requested (--update /
+# --check-update / update.bat) — a measurement tool must not phone home on
+# its own, and a surprise fetch would skew the very numbers it reports.
+# ---------------------------------------------------------------------------
+def _parse_version(text):
+    """Extract __version__ from source text as an int tuple, or None."""
+    m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    if not m:
+        return None, None
+    nums = tuple(int(x) for x in re.findall(r"\d+", m.group(1))[:3])
+    return (nums or None), m.group(1)
+
+
+def fetch_update(url, timeout=15):
+    """Download the candidate source. Returns (source_text, version_tuple,
+    version_string). Raises RuntimeError with a friendly message on any
+    problem — network, HTTP, or a payload that isn't a plausible newer us."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            raw = resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"download failed: {e}") from e
+    try:
+        src = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"payload is not UTF-8 text: {e}") from e
+    # Sanity: it must be valid Python and recognisably this application.
+    try:
+        compile(src, "netquality.py", "exec")
+    except SyntaxError as e:
+        raise RuntimeError(f"payload does not compile: {e}") from e
+    if "MAGIC" not in src or "Network Vitals" not in src:
+        raise RuntimeError("payload doesn't look like Network Vitals — wrong URL?")
+    vtuple, vstr = _parse_version(src)
+    if vtuple is None:
+        raise RuntimeError("payload has no __version__")
+    return src, vtuple, vstr
+
+
+def perform_update(url, apply=True):
+    """Check (and optionally install) the latest version. Returns an exit
+    code: 0 = up to date / updated, 1 = failed, 3 = update available (check
+    mode only, so scripts can branch on it)."""
+    local_v, _ = _parse_version(f'__version__ = "{__version__}"')
+    print(f"Network Vitals {__version__}")
+    print(f"Checking {url} …")
+    try:
+        src, remote_v, remote_s = fetch_update(url)
+    except RuntimeError as e:
+        print(f"Update check failed: {e}", file=sys.stderr)
+        return 1
+    if remote_v <= local_v:
+        print(f"Already up to date (latest is {remote_s}).")
+        return 0
+    print(f"New version available: {remote_s}")
+    if not apply:
+        return 3
+    if getattr(sys, "frozen", False):
+        print("This is a packaged .exe — it can't replace itself. Download "
+              "the new version (or rebuild with build_exe.bat) from:\n  "
+              + url, file=sys.stderr)
+        return 1
+    target = os.path.abspath(__file__)
+    backup = target + ".bak"
+    tmp = target + ".new"
+    try:
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(open(target, "r", encoding="utf-8").read())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        os.replace(tmp, target)  # atomic on the same filesystem
+    except OSError as e:
+        print(f"Install failed: {e}", file=sys.stderr)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return 1
+    print(f"Updated {os.path.basename(target)} {__version__} -> {remote_s}.")
+    print(f"(previous version saved as {os.path.basename(backup)})")
+    print("Restart the app to run the new version.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def _port_pair(text):
@@ -1427,7 +1808,19 @@ def _port_pair(text):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Bidirectional UDP/TCP network quality probe between two workstations.")
-    p.add_argument("--peer", required=True, help="IP address of the other workstation.")
+    p.add_argument("--version", action="version",
+                   version=f"Network Vitals {__version__}")
+    p.add_argument("--update", action="store_true",
+                   help="Fetch the latest version from the update URL, install "
+                        "it in place, and exit.")
+    p.add_argument("--check-update", action="store_true",
+                   help="Report whether a newer version is available, then exit "
+                        "(exit code 3 = update available).")
+    p.add_argument("--update-url", default=UPDATE_URL,
+                   help="Where --update/--check-update download from "
+                        "(default: the netvitals GitHub repo).")
+    p.add_argument("--peer", default=None,
+                   help="IP address of the other workstation.")
     p.add_argument("--bind", default="0.0.0.0",
                    help="Local address to bind/listen on (default: all interfaces).")
     p.add_argument("--udp-ports", type=_port_pair, default=DEFAULT_UDP_PORTS,
@@ -1508,8 +1901,8 @@ def run_mtu_sweep(args):
     print(f"MTU sweep -> {peer}:{port} (UDP, Don't-Fragment). "
           f"Peer must be running Network Vitals.\n")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     enlarge_socket_buffers(sock)
+    quench_udp_connreset(sock)  # peer down must read as 'dropped', not an error
     if not set_dont_fragment(sock):
         print("WARNING: could not set Don't-Fragment - results may reflect "
               "fragmentation, not true path MTU.\n")
@@ -1575,6 +1968,15 @@ def run_mtu_sweep(args):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    if args.update or args.check_update:
+        return perform_update(args.update_url, apply=args.update)
+
+    if not args.peer:
+        print("error: --peer is required (except with --update/--check-update)",
+              file=sys.stderr)
+        return 2
+
     args.size = max(HEADER_LEN, min(args.size, MAX_SIZE))
     if args.pps < 1:
         args.pps = 1
@@ -1617,4 +2019,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

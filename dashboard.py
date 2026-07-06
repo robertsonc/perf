@@ -42,6 +42,7 @@ class Dashboard:
         self._runs: list[RunAnalysis] = []
         self._app = web.Application()
         self._app.router.add_get("/", self._serve_index)
+        self._app.router.add_static("/static/", _STATIC_DIR / "static")
         self._app.router.add_get("/api/state", self._api_state)
         self._app.router.add_post("/api/stop", self._api_stop)
         self._runner: web.AppRunner | None = None

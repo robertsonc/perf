@@ -91,6 +91,7 @@ class WirePoller:
         interfaces: list[str],
         interval: float = 1.0,
         buffer_size: int = 3600,
+        recover: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.name = name
         self._reader = reader
@@ -100,7 +101,12 @@ class WirePoller:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._consecutive_errors = 0
-        self._max_consecutive_errors = 10
+        # Every N consecutive failures, invoke `recover` (e.g. an SSH
+        # reconnect) and keep polling. A poller must NEVER die silently: a
+        # dead vantage point makes the published numbers look healthy while
+        # a whole leg of the measurement is missing.
+        self._errors_per_recover = 10
+        self._recover = recover
 
     @property
     def interfaces(self) -> list[str]:
@@ -140,13 +146,22 @@ class WirePoller:
                 "Poller [%s] read failed (%d): %s",
                 self.name, self._consecutive_errors, exc,
             )
-            if self._consecutive_errors >= self._max_consecutive_errors:
-                raise
+            if (self._recover is not None
+                    and self._consecutive_errors % self._errors_per_recover == 0):
+                log.warning("Poller [%s] attempting recovery…", self.name)
+                try:
+                    await self._recover()
+                    log.info("Poller [%s] recovery succeeded", self.name)
+                except Exception as rexc:  # noqa: BLE001
+                    log.warning("Poller [%s] recovery failed: %s", self.name, rexc)
             return
         rx, tx = parse_proc_net_dev(text, self._interfaces)
         self._samples.append(
             CounterSample(t=self.now(), rx_bytes=rx, tx_bytes=tx)
         )
+        if self._consecutive_errors:
+            log.info("Poller [%s] recovered after %d failed reads",
+                     self.name, self._consecutive_errors)
         self._consecutive_errors = 0
 
     async def _run(self) -> None:
@@ -164,11 +179,17 @@ class WirePoller:
                 next_t = self.now() + self._interval
 
     def window(self, t_start: float, t_end: float) -> list[WireDelta]:
-        """Compute per-interface byte deltas for samples in [t_start, t_end].
+        """Compute per-interface byte deltas for samples covering
+        [t_start, t_end].
 
-        Uses the latest sample at-or-before t_start and at-or-before t_end to
-        bracket. If t_start preceded the buffer, falls back to the earliest
-        sample we have.
+        Brackets with the latest sample at-or-before t_start and the EARLIEST
+        sample at-or-after t_end, so the window is a superset of the run.
+        (Bracketing both edges with at-or-before silently dropped up to one
+        poll interval of end-of-run traffic — and each vantage point dropped
+        a different amount, which turned the overhead/loss byte comparisons
+        into noise.) The superset includes up to one interval of idle at each
+        edge, which contributes ~0 bytes and therefore doesn't skew the byte
+        totals the loss/overhead formulas compare.
         """
         if t_end <= t_start or not self._samples:
             return []
@@ -177,13 +198,15 @@ class WirePoller:
         for s in self._samples:
             if s.t <= t_start:
                 first = s
-            if s.t <= t_end:
-                last = s
-            if s.t > t_end:
+            if s.t >= t_end:
+                last = s  # earliest sample at-or-after the end of the run
                 break
         if first is None:
             first = self._samples[0]
-        if last is None or last.t <= first.t:
+        if last is None:
+            # No post-run sample yet: fall back to the newest one we have.
+            last = self._samples[-1]
+        if last.t <= first.t:
             return []
         duration = last.t - first.t
         deltas: list[WireDelta] = []
@@ -192,10 +215,21 @@ class WirePoller:
                 continue
             rx_delta = last.rx_bytes[iface] - first.rx_bytes[iface]
             tx_delta = last.tx_bytes[iface] - first.tx_bytes[iface]
+            if rx_delta < 0 or tx_delta < 0:
+                # Counter went backwards: NIC driver reload, appliance
+                # restart, or a hardware counter wrap. A clamped-to-zero
+                # delta would be published as a fabricated ~100% loss, so
+                # treat this vantage point as having no data for the window.
+                log.warning(
+                    "Poller [%s] counter reset on %s during window — "
+                    "discarding this vantage point for the run",
+                    self.name, iface,
+                )
+                continue
             deltas.append(WireDelta(
                 iface=iface,
-                rx_bytes=max(0, rx_delta),
-                tx_bytes=max(0, tx_delta),
+                rx_bytes=rx_delta,
+                tx_bytes=tx_delta,
                 duration_s=duration,
             ))
         return deltas

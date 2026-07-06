@@ -248,7 +248,10 @@
 
 <footer id="footer">Pollers idle.</footer>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<!-- Vendored locally (static/chart.umd.min.js, served by dashboard.py):
+     the dashboard must work on air-gapped lab/demo networks with no route
+     to any CDN from the operator's browser. -->
+<script src="/static/chart.umd.min.js"></script>
 <script>
 const COLORS = {
   client:  '#4ea8de',
