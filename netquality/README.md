@@ -24,6 +24,11 @@ firewall needs specific ports.
 Traffic flows **bi-directionally on every stream, all the time**. The UI updates
 in realtime and shows the connection's overall experience at a glance.
 
+With `--vxlan` on both ends, all four streams travel inside genuine **VXLAN
+encapsulation** between the hosts (userspace VTEP, no admin rights) — see
+*VXLAN encapsulation* below for using it to demonstrate transparent
+fragmentation.
+
 The dashboard shows **three live + history charts** with one line per stream:
 
 - **Latency (RTT, ms)**
@@ -49,9 +54,11 @@ plus, in the header:
     well beyond the RTT means SYN loss),
 - a **Reset / Clear** button that wipes the charts and all accumulated
   loss/latency/jitter stats so a demo can start from a clean slate,
-- a **Totals** button that toggles a per-stream lifetime table (sent / received
-  / lost / late / loss %). Aggregate lifetime totals are always shown in the
-  bottom status bar; both reset with **Reset / Clear**.
+- a **Totals** button that toggles a per-stream table of the since-reset
+  counters (sent / received / lost / late / loss %). The bottom status bar
+  always shows the aggregate **since reset** counters (cleared by
+  **Reset / Clear**) *and* the **lifetime** counters (never cleared while the
+  app runs), so the loss over the whole run stays visible across resets.
 - an **Isolate** button that splits each stream's round-trip loss into a
   **forward** component (probes that never reached the peer) and a **return**
   component (echoes that never made it back), and names the failing leg — see
@@ -139,6 +146,20 @@ python netquality.py --peer 10.0.0.2 --no-gui
 
 The app also falls back to the console UI automatically if no display / Tkinter
 is available.
+
+While it runs, the console UI accepts single-key commands:
+
+| Key | Action |
+|-----|--------|
+| `r` | reset the *since reset* counters/stats — same as the GUI **Reset / Clear** button |
+| `q` | quit (Ctrl-C also works) |
+
+The status area shows **two totals lines**: *since reset* (the demo window —
+press `r` to start it fresh at any time) and *lifetime* (since the app
+started; never resets). That way you can show both the loss accumulated over
+the whole duration and the loss within the last reset window, without
+stopping and restarting the app. Key handling needs an interactive terminal;
+when output is piped the keys are simply disabled and the display still works.
 
 ### Single-machine smoke test (Linux loopback aliases)
 
@@ -232,7 +253,12 @@ Bad below.
 --tcp-ports A,B    the two TCP ports (default 30101,30102)
 --pps N            probes per second per stream (default 50)
 --size N           probe packet size in bytes (default 200; e.g. 8972 for jumbo)
---dont-fragment    set the DF bit on UDP (oversized probes dropped, not split)
+--dont-fragment    set the DF bit on UDP (oversized probes dropped, not split);
+                   with --vxlan it applies to the OUTER packet
+--vxlan            carry ALL probe traffic (UDP and TCP streams) inside VXLAN
+                   encapsulation (userspace VTEP; both ends must enable it)
+--vxlan-vni N      VXLAN Network Identifier (default 4242; must match both ends)
+--vxlan-port P     outer UDP port for the tunnel (default 4789; must match both ends)
 --window SECONDS   sliding window for loss/jitter/rate (default 10)
 --timeout SECONDS  un-echoed probe -> lost after this (default 2)
 --loss-deadband P  combined loss+late below P%% reads as 0 (default 0.5; 0 off)
@@ -333,12 +359,85 @@ Forward path MTU (this host -> peer):            ~9000 bytes
 => Jumbo frames (>=9000) confirmed end to end.  ✓
 ```
 
+## VXLAN encapsulation (`--vxlan`)
+
+Run **both ends** with `--vxlan` and every probe stream — the TCP streams as
+well as the UDP ones — is carried inside genuine **VXLAN (RFC 7348)** between
+the two hosts:
+
+```
+[outer IPv4][outer UDP :4789][VXLAN vni][inner Ethernet][inner IPv4][inner UDP/TCP][probe]
+```
+
+```
+python netquality.py --peer 10.0.0.2 --vxlan
+```
+
+The app acts as its own **userspace VTEP**: it builds the whole inner
+Ethernet/IPv4/UDP-or-TCP packet itself (valid checksums, deterministic
+locally-administered MACs `02:4e:<ip>`, the real host IPs) and ships it in an
+outer UDP datagram to the peer's VXLAN port. No kernel VTEP, drivers or admin
+rights on either end, works the same on Windows and Linux, and Wireshark
+dissects it as ordinary VXLAN on `udp/4789`. All the measurement machinery —
+loss/late, forward/return isolation, size verification, the charts — works
+identically in VXLAN mode; the status bar shows `VXLAN vni N udp/4789` while
+the tunnel is active.
+
+Every probe pays a fixed encapsulation overhead on the wire:
+
+| Stream type | Extra bytes vs native | Breakdown |
+|---|---|---|
+| UDP | **+50 B** | VXLAN 8 + inner Ethernet 14 + inner IPv4 20 + inner UDP 8 |
+| TCP | **+62 B** | VXLAN 8 + inner Ethernet 14 + inner IPv4 20 + inner TCP 20 |
+
+### Demonstrating transparent fragmentation
+
+That overhead is the demo: a probe sized to fit the path MTU natively no
+longer fits once encapsulated, so the **outer** packet must fragment — and the
+inner packet crosses untouched, reassembled transparently. On a standard
+1500-byte path the outer frame is `20 (outer IP) + 8 (outer UDP) + 50 + probe`,
+so the largest probe that avoids fragmentation is **1422 B**:
+
+```
+python netquality.py --peer 10.0.0.2 --vxlan --size 1422    # exactly fills 1500
+python netquality.py --peer 10.0.0.2 --vxlan --size 1472    # overflows -> outer fragments
+```
+
+- **Without `--dont-fragment`** the oversized outer datagram is fragmented and
+  reassembled transparently: the streams stay clean and full-size (`size
+  ✓ verified`), and a capture shows the outer IPv4 fragments — transparent
+  fragmentation working end to end.
+- **With `--dont-fragment`** (DF on the *outer* packet) the oversized datagram
+  is dropped instead, so loss jumping at the same `--size` that was clean
+  natively pinpoints exactly where the encap overhead exceeds the path MTU.
+
+Notes:
+
+- **Both ends must run `--vxlan`** with the same `--vxlan-vni` and
+  `--vxlan-port`; a mixed pair sees 100% loss (the probes land on a port the
+  native transport isn't listening on).
+- **TCP streams are emulated inside the tunnel**: each probe/echo rides in its
+  own self-contained `PSH|ACK` segment with app-managed seq/ack numbers. On
+  the wire it is real TCP-in-VXLAN that switches and captures dissect
+  normally, but there is no kernel TCP state machine — no handshake,
+  retransmission or congestion control — so TCP loss shows up *directly* as
+  loss (like UDP) instead of being converted to delay, and the PQI's
+  connection-establishment term is idle. That's exactly what you want when
+  demonstrating what the fabric does to encapsulated packets.
+- If the host already terminates real VXLAN on 4789 (or another instance is
+  running), the bind fails with a clear error — move the tunnel with
+  `--vxlan-port` on both ends.
+- `--mtu-sweep` still measures the *native* path MTU; subtract the overhead
+  above to know the largest probe that fits encapsulated.
+
 ## Windows firewall
 
 The first time you run it, Windows may prompt to allow Python through the
 firewall — allow it on the relevant networks. If it was dismissed, add inbound
 rules for **UDP 30201–30202** and **TCP 30101–30102** (or whatever you set with
-`--udp-ports`/`--tcp-ports`), or allow `python.exe`.
+`--udp-ports`/`--tcp-ports`), or allow `python.exe`. In VXLAN mode the only
+port that needs to be open is the tunnel itself: **UDP 4789** (or your
+`--vxlan-port`).
 
 ## Building a standalone .exe (optional)
 

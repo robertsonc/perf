@@ -13,7 +13,12 @@ Every stream is a probe -> echo loop, so round-trip time (and therefore latency,
 loss and jitter) is measured without needing the two clocks to be synchronized.
 A realtime GUI (Tkinter, ships with Windows Python) shows per-stream loss,
 latency and jitter, plus an overall connection quality score (ITU-T E-model
-R-factor / MOS). If no display is available it falls back to a console UI.
+R-factor / MOS). If no display is available it falls back to a console UI
+(keys: r = reset counters, q = quit; shows since-reset AND lifetime totals).
+
+With --vxlan on both ends, all probe traffic is carried inside genuine VXLAN
+encapsulation between the hosts (userspace VTEP, no admin rights) - used to
+demonstrate transparent fragmentation of encapsulated traffic.
 
 Typical use
 -----------
@@ -28,6 +33,7 @@ Local loopback smoke test (one machine, Linux only - two loopback aliases):
 """
 
 import argparse
+import array
 import math
 import os
 import re
@@ -39,7 +45,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -271,6 +277,15 @@ class StreamStats:
         self.cum_lost = 0
         self.cum_late = 0
 
+        # Lifetime counters: same tallies as cum_* but NEVER cleared by
+        # reset(), so the UI can show "since reset" and "lifetime" side by
+        # side - the loss over the whole run vs. the loss since the last
+        # reset, without restarting the app.
+        self.life_tx = 0
+        self.life_recv = 0
+        self.life_lost = 0
+        self.life_late = 0
+
         # packet-size verification (jumbo-frame testing)
         self.rx_echo_max = 0      # largest echo datagram received (return path)
         self.peer_rx_max = 0      # largest size the far end reported receiving
@@ -341,6 +356,7 @@ class StreamStats:
             self.pending[seq] = (now_m, send_ns)
             self.tx_events.append(now_m)
             self.cum_tx += 1
+            self.life_tx += 1
             self._trim_locked()
 
     def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0, peer_fwd=0):
@@ -378,6 +394,7 @@ class StreamStats:
                 self.resolved_order.append((now_w, seq))
                 self.rtt_samples.append((now_w, rtt))
                 self.cum_recv += 1
+                self.life_recv += 1
                 if self.last_rtt is not None:
                     d = abs(rtt - self.last_rtt)
                     # smoothed mean deviation, RFC 3550 J += (|D|-J)/16
@@ -390,6 +407,8 @@ class StreamStats:
                 self.state[seq] = "late"
                 self.cum_lost -= 1
                 self.cum_late += 1
+                self.life_lost -= 1
+                self.life_late += 1
                 self.last_echo_t = now_w
             # else: duplicate, or so old it has been trimmed -> ignore.
             self._trim_locked()
@@ -406,6 +425,7 @@ class StreamStats:
                 self.state[s] = "lost"
                 self.resolved_order.append((now_w, s))
                 self.cum_lost += 1
+                self.life_lost += 1
             self._trim_locked()
 
     def on_connect(self, dt_ms):
@@ -484,6 +504,10 @@ class StreamStats:
                 "cum_recv": self.cum_recv,
                 "cum_lost": self.cum_lost,
                 "cum_late": self.cum_late,
+                "life_tx": self.life_tx,
+                "life_recv": self.life_recv,
+                "life_lost": self.life_lost,
+                "life_late": self.life_late,
                 "rx_echo_max": self.rx_echo_max,
                 "peer_rx_max": self.peer_rx_max,
                 "size_mismatch": self.size_mismatch,
@@ -496,7 +520,9 @@ class StreamStats:
             }
 
     def reset(self):
-        """Drop all accumulated samples/counters (used by the UI Reset button)."""
+        """Drop all accumulated samples/counters (used by the GUI Reset button
+        and the console 'r' key). The life_* lifetime counters deliberately
+        survive, so "since reset" and "lifetime" can be shown side by side."""
         with self.lock:
             self.rtt_samples.clear()
             self.tx_events.clear()
@@ -990,22 +1016,322 @@ class TCPStream:
 
 
 # ---------------------------------------------------------------------------
+# VXLAN encapsulation (userspace VTEP)
+# ---------------------------------------------------------------------------
+# --vxlan carries every probe stream inside genuine VXLAN (RFC 7348): the app
+# builds the whole inner Ethernet/IPv4/UDP-or-TCP packet itself and ships it
+# in an outer UDP datagram to the peer's VXLAN port. The wire then carries
+# real, dissectable VXLAN between the two hosts - no kernel VTEP, drivers or
+# admin rights on either end, and it works the same on Windows and Linux.
+#
+# The point for demos: encapsulation adds a fixed overhead to every probe, so
+# a probe sized to fit the path MTU natively no longer fits once encapsulated
+# and the OUTER packet must fragment (or be dropped with --dont-fragment) -
+# the "transparent fragmentation" case made visible with the same loss/size
+# verification machinery the app already has.
+
+VXLAN_DEFAULT_PORT = 4789   # IANA-assigned VXLAN port; Wireshark dissects it
+VXLAN_DEFAULT_VNI = 4242
+
+# Bytes ADDED on the wire versus a native probe (the outer IPv4+UDP headers
+# replace the native ones like-for-like, so the extra is the VXLAN header
+# plus the entire inner frame's headers):
+VXLAN_OVERHEAD_UDP = 8 + 14 + 20 + 8    # VXLAN + inner Ether + IPv4 + UDP = 50
+VXLAN_OVERHEAD_TCP = 8 + 14 + 20 + 20   # VXLAN + inner Ether + IPv4 + TCP = 62
+
+# The OS caps a UDP datagram's payload at 65507 B; the biggest inner probe
+# must still fit alongside the encap headers.
+VXLAN_MAX_PROBE = 65507 - VXLAN_OVERHEAD_TCP
+
+
+def _inet_checksum(data):
+    """RFC 1071 internet checksum, for the inner IPv4/UDP/TCP headers (so
+    captures dissect as valid packets, not checksum errors)."""
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(array.array("H", data))     # native-endian 16-bit word sum
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    s = ~s & 0xFFFF
+    if sys.byteorder == "little":       # sum was native-endian; emit network order
+        s = ((s & 0xFF) << 8) | (s >> 8)
+    return s
+
+
+def local_ip_toward(peer, bind):
+    """The local IP the OS routes traffic to `peer` from - used as the inner
+    IPv4 source when --bind is the 0.0.0.0 wildcard. No packet is sent."""
+    if bind not in ("", "0.0.0.0"):
+        return bind
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((peer, 9))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return "0.0.0.0"
+
+
+def _mac_for_ip(ip):
+    """Deterministic locally-administered MAC for an IP (02:4e + the four IP
+    octets), so both ends' captures show the same stable inner MACs."""
+    try:
+        octets = socket.inet_aton(ip)
+    except OSError:
+        octets = b"\x00\x00\x00\x00"
+    return b"\x02\x4e" + octets
+
+
+class VXLANTunnel:
+    """Minimal userspace VXLAN VTEP shared by all four probe streams.
+
+    One UDP socket (default port 4789, --vxlan-port) both sends and receives
+    the outer datagrams; both ends must run --vxlan with the same VNI and
+    port. Inner packets are fully formed Ethernet+IPv4+UDP/TCP with valid
+    checksums and the real host IPs, so transit gear and captures see
+    ordinary VXLAN traffic.
+
+    Inner TCP is EMULATED: each probe/echo rides in its own self-contained
+    PSH|ACK segment with app-managed seq/ack numbers. On the wire it is real
+    TCP-in-VXLAN, but there is no kernel TCP state machine inside the tunnel
+    (no handshake, retransmission or congestion control), so TCP-stream loss
+    shows directly as loss - exactly what a fragmentation demo wants.
+    """
+
+    def __init__(self, peer, bind, vni, port, stop, dont_fragment=False):
+        self.peer = peer
+        self.bind = bind
+        self.vni = vni & 0xFFFFFF
+        self.port = port
+        self.stop = stop
+        self.dont_fragment = dont_fragment
+        self.sock = None
+        self.peer_ip = None
+        self.local_ip = None
+        self.local_mac = self.peer_mac = b"\x00" * 6
+        self.handlers = {}     # (proto, inner port) -> callback(payload bytes)
+        self._lock = threading.Lock()
+        self._ip_id = 0        # inner IPv4 identification counter
+        self._tcp_seq = {}     # inner port -> next TCP seq we send
+        self._tcp_ack = {}     # inner port -> next TCP seq we expect (their seq+len)
+        self.thread = None
+
+    def register(self, proto, port, handler):
+        """Route decapsulated payloads for (proto, inner dst port) to handler."""
+        self.handlers[(proto, port)] = handler
+
+    def start(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        bind_exclusively(s)
+        enlarge_socket_buffers(s)
+        quench_udp_connreset(s)
+        if self.dont_fragment:
+            set_dont_fragment(s)   # DF on the OUTER packet: encap overflow drops
+        s.bind((self.bind, self.port))
+        s.settimeout(0.5)
+        self.sock = s
+        self.peer_ip = resolve_peer_ip(self.peer)
+        self.local_ip = local_ip_toward(self.peer, self.bind)
+        self.local_mac = _mac_for_ip(self.local_ip)
+        self.peer_mac = _mac_for_ip(self.peer_ip or "0.0.0.0")
+        self.thread = threading.Thread(target=self._recv_loop, name="vxlan-rx",
+                                       daemon=True)
+        self.thread.start()
+
+    # -- encapsulation ------------------------------------------------------
+    def send(self, proto, port, payload):
+        """Encapsulate one probe/echo message and send it to the peer's VXLAN
+        port. Returns True if the datagram left the socket."""
+        try:
+            self.sock.sendto(self._encap(proto, port, payload),
+                             (self.peer, self.port))
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _l4_checksum(src, dst, proto_num, segment):
+        pseudo = src + dst + struct.pack("!BBH", 0, proto_num, len(segment))
+        return _inet_checksum(pseudo + segment)
+
+    def _encap(self, proto, port, payload):
+        src = socket.inet_aton(self.local_ip or "0.0.0.0")
+        dst = socket.inet_aton(self.peer_ip or "0.0.0.0")
+        if proto == "TCP":
+            proto_num = 6
+            with self._lock:
+                seq = self._tcp_seq.get(port, 1)
+                self._tcp_seq[port] = (seq + len(payload)) & 0xFFFFFFFF
+                ack = self._tcp_ack.get(port, 0)
+            l4 = struct.pack("!HHIIBBHHH", port, port, seq, ack,
+                             5 << 4, 0x18, 65535, 0, 0)   # PSH|ACK
+            csum = self._l4_checksum(src, dst, proto_num, l4 + payload)
+            l4 = l4[:16] + struct.pack("!H", csum) + l4[18:]
+        else:
+            proto_num = 17
+            l4 = struct.pack("!HHHH", port, port, 8 + len(payload), 0)
+            # A computed UDP checksum of 0 is transmitted as 0xFFFF (RFC 768).
+            csum = self._l4_checksum(src, dst, proto_num, l4 + payload) or 0xFFFF
+            l4 = l4[:6] + struct.pack("!H", csum)
+        total = 20 + len(l4) + len(payload)
+        with self._lock:
+            self._ip_id = (self._ip_id + 1) & 0xFFFF
+            ip_id = self._ip_id
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, ip_id, 0, 64,
+                         proto_num, 0, src, dst)
+        ip = ip[:10] + struct.pack("!H", _inet_checksum(ip)) + ip[12:]
+        eth = self.peer_mac + self.local_mac + b"\x08\x00"
+        vxlan = struct.pack("!II", 0x08 << 24, self.vni << 8)
+        return vxlan + eth + ip + l4 + payload
+
+    # -- decapsulation ------------------------------------------------------
+    def _decap(self, data):
+        """Parse VXLAN + inner Ethernet/IPv4/L4. Returns (proto, port,
+        payload) or None for anything that isn't ours. Inner checksums are
+        not re-verified - the outer UDP checksum already covered the bytes."""
+        if len(data) < 8 + 14 + 20 + 8:
+            return None
+        if not (data[0] & 0x08):                       # VNI-present flag
+            return None
+        if int.from_bytes(data[4:7], "big") != self.vni:
+            return None
+        eth = 8
+        if data[eth + 12:eth + 14] != b"\x08\x00":     # inner EtherType IPv4
+            return None
+        ip = eth + 14
+        if data[ip] >> 4 != 4:
+            return None
+        ihl = (data[ip] & 0x0F) * 4
+        total = int.from_bytes(data[ip + 2:ip + 4], "big")
+        end = min(len(data), ip + total)               # ignore trailing padding
+        proto_num = data[ip + 9]
+        l4 = ip + ihl
+        if proto_num == 17 and end >= l4 + 8:
+            dport = int.from_bytes(data[l4 + 2:l4 + 4], "big")
+            ulen = int.from_bytes(data[l4 + 4:l4 + 6], "big")
+            return "UDP", dport, data[l4 + 8:min(end, l4 + ulen)]
+        if proto_num == 6 and end >= l4 + 20:
+            dport = int.from_bytes(data[l4 + 2:l4 + 4], "big")
+            seq = int.from_bytes(data[l4 + 4:l4 + 8], "big")
+            doff = (data[l4 + 12] >> 4) * 4
+            payload = data[l4 + doff:end]
+            with self._lock:   # our next segment ACKs what we just received
+                self._tcp_ack[dport] = (seq + len(payload)) & 0xFFFFFFFF
+            return "TCP", dport, payload
+        return None
+
+    def _recv_loop(self):
+        while not self.stop.is_set():
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except ConnectionResetError:
+                continue   # Windows ICMP Port Unreachable; peer not up yet
+            except OSError:
+                if self.stop.is_set():
+                    break
+                time.sleep(0.1)
+                continue
+            # Peer-only, like the native streams: a hostile/chatty LAN must
+            # not be able to skew stats or bounce packets off the tunnel.
+            if self.peer_ip is not None and addr[0] != self.peer_ip:
+                continue
+            decap = self._decap(data)
+            if decap is None:
+                continue
+            proto, port, payload = decap
+            handler = self.handlers.get((proto, port))
+            if handler is not None:
+                handler(payload)
+
+
+class VXStream:
+    """One probe stream carried through the shared VXLAN tunnel.
+
+    Originates probes and reflects the peer's exactly like UDPStream, but
+    every message is one inner packet inside the tunnel, stamped with the
+    stream's catalogue protocol (UDP or TCP) and port. Framing is packet-per-
+    probe even for the TCP streams, so the probe/echo state machine (and all
+    loss/size accounting) is identical across all four streams."""
+
+    def __init__(self, cfg, tunnel, size, interval, stats, stop):
+        self.sid, self.proto, self.port, self.name = cfg
+        self.tunnel = tunnel
+        self.size = size
+        self.interval = interval
+        self.stats = stats
+        self.stop = stop
+        self.threads = []
+        tunnel.register(self.proto, self.port, self._on_payload)
+
+    def start(self):
+        self.threads = [threading.Thread(target=self._send_loop,
+                                         name=f"{self.name}-vxtx", daemon=True)]
+        for t in self.threads:
+            t.start()
+
+    def _send_loop(self):
+        seq = 0
+        next_t = time.monotonic()
+        while not self.stop.is_set():
+            seq += 1
+            ns = time.monotonic_ns()
+            pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, self.size)
+            if self.tunnel.send(self.proto, self.port, pkt):
+                self.stats.on_send(seq, ns)
+            self.stats.reap()
+            next_t += self.interval
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                self.stop.wait(delay)
+            else:
+                next_t = time.monotonic()
+
+    def _on_payload(self, payload):
+        parsed = parse_header(payload)
+        if parsed is None:
+            return
+        ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
+        if ptype == TYPE_PROBE:
+            rxlen = len(payload)
+            fwd = self.stats.on_probe_rx(seq)
+            echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
+                                rxsize=rxlen, rxcount=fwd)
+            self.tunnel.send(self.proto, self.port, echo)
+        elif ptype == TYPE_ECHO:
+            self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
+                               rx_len=len(payload), psize=psize, peer_rx=rxsize,
+                               peer_fwd=rxcount)
+
+
+# ---------------------------------------------------------------------------
 # Engine: owns all streams + their stats
 # ---------------------------------------------------------------------------
 class Engine:
     def __init__(self, peer, bind, size, pps, window, timeout, history_seconds=300,
-                 loss_deadband=0.5, dont_fragment=False):
+                 loss_deadband=0.5, dont_fragment=False, vxlan=None):
         self.peer = peer
         self.bind = bind
         self.size = size
         self.dont_fragment = dont_fragment
+        self.vxlan = vxlan  # None, or {"vni": int, "port": int}
         self.stop = threading.Event()
         self.start_time = time.monotonic()
+        self.last_reset = time.monotonic()
         self.history_seconds = history_seconds
         self.loss_deadband = loss_deadband  # combined loss+late below this reads as 0
         interval = 1.0 / pps
         self.stats = {}
         self.streams = []
+        # In VXLAN mode ALL four streams ride one shared userspace VTEP; the
+        # native per-port UDP/TCP transports are not opened at all.
+        self.tunnel = None
+        if vxlan:
+            self.tunnel = VXLANTunnel(peer, bind, vxlan["vni"], vxlan["port"],
+                                      self.stop, dont_fragment=dont_fragment)
         # Per-second history ring buffer per stream, for the live/history charts.
         self.history = {cfg[0]: deque(maxlen=history_seconds + 2) for cfg in STREAMS}
         self.history_lock = threading.Lock()
@@ -1013,13 +1339,18 @@ class Engine:
             sid, proto, port, name = cfg
             st = StreamStats(window=window, timeout=timeout, target_pps=pps)
             self.stats[sid] = st
-            if proto == "UDP":
+            if self.tunnel is not None:
+                self.streams.append(VXStream(cfg, self.tunnel, size, interval,
+                                             st, self.stop))
+            elif proto == "UDP":
                 self.streams.append(UDPStream(cfg, peer, bind, size, interval, st,
                                               self.stop, dont_fragment=dont_fragment))
             else:
                 self.streams.append(TCPStream(cfg, peer, bind, size, interval, st, self.stop))
 
     def start(self):
+        if self.tunnel is not None:
+            self.tunnel.start()
         for s in self.streams:
             s.start()
         threading.Thread(target=self._sampler, name="history-sampler", daemon=True).start()
@@ -1063,6 +1394,7 @@ class Engine:
         proto_score = {"UDP": [], "TCP": []}
         tot_tx = tot_recv = tot_lost = tot_late = 0
         tot_fwd = tot_rtn = 0
+        life_tx = life_recv = life_lost = life_late = 0
         for sid, proto, port, name in STREAMS:
             snap = self.stats[sid].snapshot()
             eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
@@ -1086,6 +1418,10 @@ class Engine:
             tot_late += snap["cum_late"]
             tot_fwd += snap["fwd_lost"]
             tot_rtn += snap["rtn_lost"]
+            life_tx += snap["life_tx"]
+            life_recv += snap["life_recv"]
+            life_lost += snap["life_lost"]
+            life_late += snap["life_late"]
             if snap["connected"] and snap["samples"] > 0:
                 scores.append(score)
                 if mos is not None:
@@ -1103,6 +1439,7 @@ class Engine:
             overall = 0.0
             worst = 0.0
         decided = tot_recv + tot_lost + tot_late
+        life_decided = life_recv + life_lost + life_late
         totals = {
             "tx": tot_tx, "recv": tot_recv, "lost": tot_lost, "late": tot_late,
             "loss_pct": (tot_lost / decided * 100.0) if decided else 0.0,
@@ -1110,6 +1447,11 @@ class Engine:
             "fwd_lost": tot_fwd, "rtn_lost": tot_rtn,
             "fwd_pct": (tot_fwd / tot_tx * 100.0) if tot_tx else 0.0,
             "rtn_pct": (tot_rtn / tot_tx * 100.0) if tot_tx else 0.0,
+            # lifetime counterparts: never reset while the app runs
+            "life_tx": life_tx, "life_recv": life_recv,
+            "life_lost": life_lost, "life_late": life_late,
+            "life_loss_pct": (life_lost / life_decided * 100.0) if life_decided else 0.0,
+            "life_late_pct": (life_late / life_decided * 100.0) if life_decided else 0.0,
         }
         # Aggregate size verification across the UDP streams (the jumbo-relevant
         # ones): "verified" once full-size datagrams have round-tripped both ways.
@@ -1130,20 +1472,25 @@ class Engine:
             "worst": worst,
             "overall_label": score_label(overall) if scores else "No link",
             "uptime": time.monotonic() - self.start_time,
+            "since_reset": time.monotonic() - self.last_reset,
             "links_up": len(scores),
             "totals": totals,
             "frame_size": self.size,
             "dont_fragment": self.dont_fragment,
+            "vxlan": self.vxlan,
             "size_status": size_status,
         }
 
     def reset(self):
-        """Clear all measurement state and chart history (for a clean demo)."""
+        """Clear all measurement state and chart history (for a clean demo).
+        Lifetime totals keep accruing so loss over the whole run stays
+        visible next to the fresh since-reset window."""
         for st in self.stats.values():
             st.reset()
         with self.history_lock:
             for dq in self.history.values():
                 dq.clear()
+        self.last_reset = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -1545,14 +1892,18 @@ def run_gui(engine, args):
         df = "on" if snap["dont_fragment"] else "off"
         size_tag = {"verified": "✓ verified", "mismatch": "⚠ MISMATCH",
                     "pending": "…"}[snap["size_status"]]
+        vx = (f"  VXLAN vni {snap['vxlan']['vni']} udp/{snap['vxlan']['port']}"
+              if snap["vxlan"] else "")
         foot_var.set(
             f"peer {args.peer}    {ports_summary()}    "
-            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}    "
+            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}    "
             f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}"
             f"    |  since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
             f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  "
             f"[fwd→ {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)  "
-            f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)]")
+            f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)]"
+            f"    |  lifetime:  sent {t['life_tx']:,}  "
+            f"lost {t['life_lost']:,} ({t['life_loss_pct']:.2f}%)")
 
         if isolate_shown["on"]:
             for row in snap["rows"]:
@@ -1640,12 +1991,87 @@ def enable_vt_mode():
         return False
 
 
+class ConsoleKeys:
+    """Non-blocking single-key reader for the console UI ('r' = reset
+    counters, 'q' = quit). Windows polls msvcrt; POSIX puts the TTY in cbreak
+    mode (restored on exit) and selects on stdin. When stdin isn't an
+    interactive terminal (piped, service) key handling is simply disabled and
+    poll() degrades to a plain sleep."""
+
+    def __init__(self):
+        self.enabled = False
+        self._posix_state = None
+
+    def __enter__(self):
+        if sys.platform == "win32":
+            try:
+                import msvcrt  # noqa: F401
+                self.enabled = True
+            except ImportError:
+                pass
+        else:
+            try:
+                if sys.stdin.isatty():
+                    import termios
+                    import tty
+                    fd = sys.stdin.fileno()
+                    self._posix_state = (fd, termios.tcgetattr(fd))
+                    tty.setcbreak(fd)  # keeps ISIG, so Ctrl-C still works
+                    self.enabled = True
+            except Exception:
+                self._posix_state = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._posix_state is not None:
+            import termios
+            fd, old = self._posix_state
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except Exception:
+                pass
+        return False
+
+    def poll(self, timeout):
+        """Wait up to `timeout` seconds; return a lowercased key or None."""
+        if not self.enabled:
+            time.sleep(timeout)
+            return None
+        if sys.platform == "win32":
+            import msvcrt
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if msvcrt.kbhit():
+                    return msvcrt.getwch().lower()
+                time.sleep(0.05)
+            return None
+        import select
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if r:
+            return sys.stdin.read(1).lower()
+        return None
+
+
+def _hms(seconds):
+    s = int(seconds)
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
 def run_console(engine, args):
     vt = enable_vt_mode()
     print(f"Network Vitals {__version__}  peer={args.peer}  bind={args.bind}  "
           f"{ports_summary()}  {args.pps} probes/s/stream")
     print("Ctrl-C to stop.\n")
     try:
+        run_console_loop(engine, args, vt)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        engine.shutdown()
+
+
+def run_console_loop(engine, args, vt):
+    with ConsoleKeys() as keys:
         while not engine.stop.is_set():
             snap = engine.snapshot()
             if vt:
@@ -1674,29 +2100,40 @@ def run_console(engine, args):
                     print(f"  {r['name']:<10}{st:<8}{'-':>9}{'-':>9}{'-':>9}"
                           f"{r['loss']:>9.1f}{r['late']:>9.1f}{'-':>7}{'-':>6}"
                           f"{r['tx_pps']:>8.0f}{r['rx_pps']:>8.0f}")
-            up = int(snap["uptime"])
             t = snap["totals"]
             df = "on" if snap["dont_fragment"] else "off"
             size_tag = {"verified": "verified", "mismatch": "MISMATCH",
                         "pending": "pending"}[snap["size_status"]]
+            vx = (f"   VXLAN vni {snap['vxlan']['vni']} udp/{snap['vxlan']['port']}"
+                  if snap["vxlan"] else "")
             print("  " + "-" * 100)
-            print(f"  frame {snap['frame_size']} B   DF {df}   size {size_tag}"
+            print(f"  frame {snap['frame_size']} B   DF {df}   size {size_tag}{vx}"
                   f"   (UDP peer-RX / my-RX per stream:"
                   + "".join(f"  {r['name'].split('-')[1]} {r['peer_rx_max']}/{r['rx_echo_max']}"
                             for r in snap["rows"] if r["proto"] == "UDP") + ")")
-            print(f"  totals since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
+            # Two totals lines: the resettable demo window and the lifetime
+            # run, so loss over the whole duration and loss since the last
+            # reset are both visible without restarting the app.
+            print(f"  since reset ({_hms(snap['since_reset'])}):"
+                  f"  sent {t['tx']:,}  recv {t['recv']:,}  "
                   f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  late {t['late']:,} "
                   f"({t['late_pct']:.2f}%)")
-            print(f"  loss split:  forward -> {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)   "
+            print(f"  lifetime    ({_hms(snap['uptime'])}):"
+                  f"  sent {t['life_tx']:,}  recv {t['life_recv']:,}  "
+                  f"lost {t['life_lost']:,} ({t['life_loss_pct']:.2f}%)  "
+                  f"late {t['life_late']:,} ({t['life_late_pct']:.2f}%)")
+            print(f"  loss split (since reset):  forward -> {t['fwd_lost']:,} "
+                  f"({t['fwd_pct']:.2f}%)   "
                   f"return <- {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)"
                   + "".join(f"   {r['name'].split('-')[1]}:{loss_verdict(r['fwd_lost'], r['rtn_lost'])[0]}"
                             for r in snap["rows"] if r["fwd_lost"] > 6 or r["rtn_lost"] > 6))
-            print(f"  uptime {up//3600:02d}:{(up%3600)//60:02d}:{up%60:02d}")
-            time.sleep(args.refresh_ms / 1000.0)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        engine.shutdown()
+            if keys.enabled:
+                print("  keys:  [r] reset counters    [q] quit    (Ctrl-C also quits)")
+            key = keys.poll(args.refresh_ms / 1000.0)
+            if key == "r":
+                engine.reset()
+            elif key in ("q", "\x03"):   # 'q', or Ctrl-C swallowed by getwch
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -1837,7 +2274,21 @@ def parse_args(argv=None):
                         % (HEADER_LEN, MAX_SIZE))
     p.add_argument("--dont-fragment", action="store_true",
                    help="Set the IPv4 Don't-Fragment bit on UDP so oversized probes "
-                        "are dropped, not fragmented (required to truly test jumbo).")
+                        "are dropped, not fragmented (required to truly test jumbo). "
+                        "With --vxlan it applies to the OUTER packet, so encap "
+                        "overflow drops instead of fragmenting.")
+    p.add_argument("--vxlan", action="store_true",
+                   help="Carry ALL probe traffic (UDP and TCP streams) inside "
+                        "VXLAN encapsulation between the two hosts. The app is "
+                        "its own userspace VTEP - no drivers or admin rights. "
+                        "Both ends must run --vxlan (same VNI and port).")
+    p.add_argument("--vxlan-vni", type=int, default=VXLAN_DEFAULT_VNI, metavar="N",
+                   help="VXLAN Network Identifier, 0-16777215 (default %d). "
+                        "Must match on both ends." % VXLAN_DEFAULT_VNI)
+    p.add_argument("--vxlan-port", type=int, default=VXLAN_DEFAULT_PORT, metavar="P",
+                   help="Outer UDP port for the VXLAN tunnel (default %d, the "
+                        "IANA VXLAN port). Must match on both ends."
+                        % VXLAN_DEFAULT_PORT)
     p.add_argument("--window", type=float, default=10.0,
                    help="Sliding window in seconds for loss/jitter/rates (default 10).")
     p.add_argument("--timeout", type=float, default=2.0,
@@ -1981,6 +2432,21 @@ def main(argv=None):
     if args.pps < 1:
         args.pps = 1
 
+    vxlan = None
+    if args.vxlan:
+        if not (0 <= args.vxlan_vni <= 0xFFFFFF):
+            print("error: --vxlan-vni must be 0..16777215", file=sys.stderr)
+            return 2
+        if not (1 <= args.vxlan_port <= 65535):
+            print("error: --vxlan-port out of range 1-65535", file=sys.stderr)
+            return 2
+        if args.size > VXLAN_MAX_PROBE:
+            print(f"note: --size capped to {VXLAN_MAX_PROBE} in VXLAN mode "
+                  f"(encap headers must fit in the outer datagram).",
+                  file=sys.stderr)
+            args.size = VXLAN_MAX_PROBE
+        vxlan = {"vni": args.vxlan_vni, "port": args.vxlan_port}
+
     # Apply chosen ports (read as a module global by the engine and UI).
     global STREAMS
     STREAMS = build_streams(args.udp_ports, args.tcp_ports)
@@ -1993,8 +2459,17 @@ def main(argv=None):
     engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
                     args.timeout, history_seconds=args.history,
                     loss_deadband=args.loss_deadband,
-                    dont_fragment=args.dont_fragment)
-    engine.start()
+                    dont_fragment=args.dont_fragment, vxlan=vxlan)
+    try:
+        engine.start()
+    except OSError as e:
+        if vxlan:
+            print(f"error: cannot bind the VXLAN tunnel on "
+                  f"{args.bind}:{vxlan['port']}/udp ({e}). Another VTEP or "
+                  f"instance on this port? Change it with --vxlan-port "
+                  f"(on BOTH ends).", file=sys.stderr)
+            return 2
+        raise
 
     use_gui = not args.no_gui
     if use_gui:
